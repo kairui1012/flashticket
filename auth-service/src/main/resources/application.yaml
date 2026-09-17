@@ -1,0 +1,31 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: auth-service
+
+  datasource:
+    url: jdbc:mysql://localhost:3307/flashticket_auth?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Kuala_Lumpur
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+
+  configuration:
+    map-underscore-to-camel-case: true
+
+jwt:
+  private-key: file:../keys/private.pem
+  public-key: file:../keys/public.pem
+  
+logging:
+  level:
+    com.flashticket.authservice.mapper: DEBUG

@@ -1,0 +1,7 @@
+CREATE TABLE IF NOT EXISTS auth_accounts (
+    id VARCHAR(36) PRIMARY KEY,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    password VARCHAR(255) NOT NULL,
+    status VARCHAR(30) NOT NULL,
+    created_at DATETIME NOT NULL
+);
