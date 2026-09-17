@@ -8,5 +8,5 @@ public interface AuthAccountMapper {
 
     AuthAccount findByEmail(String email);
 
-    int insert(AuthAccount authAccount);
+    void insert(AuthAccount authAccount);
 }
