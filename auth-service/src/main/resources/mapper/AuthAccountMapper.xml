@@ -13,6 +13,7 @@
         email,
         password,
         status,
+        role,
         created_at
         FROM auth_accounts
         WHERE email = #{email}
@@ -27,6 +28,7 @@
         email,
         password,
         status,
+        role,
         created_at
         )
         VALUES (
@@ -34,6 +36,7 @@
         #{email},
         #{password},
         #{status},
+        #{role},
         #{createdAt}
         )
 

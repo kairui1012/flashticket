@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.flashticket.ticketservice.mapper.TicketMapper">
+
+    <resultMap id="TicketResultMap"
+               type="com.flashticket.ticketservice.entity.Ticket">
+
+        <id property="id" column="id"/>
+
+        <result property="eventId" column="event_id"/>
+        <result property="name" column="name"/>
+        <result property="description" column="description"/>
+        <result property="price" column="price"/>
+        <result property="totalStock" column="total_stock"/>
+        <result property="saleStartTime" column="sale_start_time"/>
+        <result property="saleEndTime" column="sale_end_time"/>
+        <result property="status" column="status"/>
+        <result property="createdAt" column="created_at"/>
+
+    </resultMap>
+
+    <insert id="createTicket">
+        INSERT INTO tickets (
+        id,
+        event_id,
+        name,
+        description,
+        price,
+        total_stock,
+        sale_start_time,
+        sale_end_time,
+        status,
+        created_at
+        )
+        VALUES (
+        #{id},
+        #{eventId},
+        #{name},
+        #{description},
+        #{price},
+        #{totalStock},
+        #{saleStartTime},
+        #{saleEndTime},
+        #{status},
+        #{createdAt}
+        )
+    </insert>
+
+    <select id="findById" resultMap="TicketResultMap">
+        SELECT *
+        FROM tickets
+        WHERE id = #{id}
+    </select>
+
+    <select id="findByEventId" resultMap="TicketResultMap">
+        SELECT *
+        FROM tickets
+        WHERE event_id = #{eventId}
+    </select>
+
+    <update id="updateTicketStatusToCancelById">
+        UPDATE tickets
+        SET status = 'CANCELLED'
+        WHERE id = #{id}
+        AND status NOT IN ('CANCELLED', 'ENDED')
+    </update>
+
+
+    <update id="updateTicketById">
+        UPDATE tickets
+        <set>
+            <if test="request.name != null">
+                name = #{request.name},
+            </if>
+            <if test="request.description != null">
+                description = #{request.description},
+            </if>
+            <if test="request.price != null">
+                price = #{request.price},
+            </if>
+            <if test="request.saleStartTime != null">
+                sale_start_time = #{request.saleStartTime},
+            </if>
+            <if test="request.saleEndTime != null">
+                sale_end_time = #{request.saleEndTime},
+            </if>
+        </set>
+        WHERE id = #{id}
+    </update>
+
+
+</mapper>

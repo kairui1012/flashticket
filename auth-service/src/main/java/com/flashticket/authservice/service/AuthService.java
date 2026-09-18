@@ -4,6 +4,7 @@ import com.flashticket.authservice.dto.AuthResponse;
 import com.flashticket.authservice.dto.LoginRequest;
 import com.flashticket.authservice.dto.RegisterRequest;
 import com.flashticket.authservice.entity.AuthAccount;
+import com.flashticket.authservice.entity.UserRole;
 import com.flashticket.authservice.entity.UserStatus;
 import com.flashticket.authservice.mapper.AuthAccountMapper;
 import lombok.RequiredArgsConstructor;
@@ -76,6 +77,7 @@ public class AuthService {
         AuthAccount account = new AuthAccount();
         account.setId(UUID.randomUUID().toString());
         account.setStatus(UserStatus.ACTIVE);
+        account.setRole(UserRole.USER);
         account.setEmail(registerRequest.getEmail());
         account.setPassword(encodedPassword);
         account.setCreatedAt(LocalDateTime.now());

@@ -4,8 +4,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.io.Resource;
-import org.springframework.security.oauth2.jwt.JwtDecoder;
-import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
+import org.springframework.security.oauth2.jwt.NimbusReactiveJwtDecoder;
+import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
 
 import java.security.KeyFactory;
 import java.security.PublicKey;
@@ -49,11 +49,11 @@ public class JwtConfig {
     }
 
     @Bean
-    public JwtDecoder jwtDecoder() throws Exception{
+    public ReactiveJwtDecoder jwtDecoder() throws Exception{
         // STEP 1: Load the RSA public key.
         RSAPublicKey publicKey = (RSAPublicKey) loadPublicKey();
 
         // STEP 2: Create a JWT decoder with the RSA public key.
-        return NimbusJwtDecoder.withPublicKey(publicKey).build();
+        return NimbusReactiveJwtDecoder.withPublicKey(publicKey).build();
     }
 }

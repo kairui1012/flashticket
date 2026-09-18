@@ -9,6 +9,7 @@ import org.springframework.security.oauth2.jwt.JwtEncoderParameters;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
+import java.util.List;
 
 @Service
 @RequiredArgsConstructor
@@ -30,7 +31,9 @@ public class TokenService {
         JwtClaimsSet claims = JwtClaimsSet.builder()
                 .subject(sub)
                 .issuedAt(issuedAt)
-                .expiresAt(expiresAt).build();
+                .expiresAt(expiresAt)
+                .claim("roles", List.of("ROLE_" + account.getRole().name()))
+                .build();
 
         // STEP 4: Convert the claims into encoder parameters.
         JwtEncoderParameters parameters = JwtEncoderParameters.from(claims);

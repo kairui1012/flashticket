@@ -10,5 +10,6 @@ public class AuthAccount {
     private String email;
     private String password;
     private UserStatus status;
+    private UserRole role;
     private LocalDateTime createdAt;
 }

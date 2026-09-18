@@ -3,5 +3,6 @@ CREATE TABLE IF NOT EXISTS auth_accounts (
     email VARCHAR(255) NOT NULL UNIQUE,
     password VARCHAR(255) NOT NULL,
     status VARCHAR(30) NOT NULL,
+    role VARCHAR(30) NOT NULL DEFAULT 'USER',
     created_at DATETIME NOT NULL
 );

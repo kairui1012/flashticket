@@ -1,9 +1,14 @@
 server:
-  port: 8081
+  port: 8082
 
 spring:
   application:
-    name: auth-service
+    name: tikcet-service
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
 
   datasource:
     url: jdbc:mysql://localhost:3307/flashticket_auth?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Kuala_Lumpur
@@ -22,13 +27,10 @@ mybatis:
   configuration:
     map-underscore-to-camel-case: true
 
-jwt:
-  private-key: file:../keys/private.pem
-  public-key: file:../keys/public.pem
-  
 logging:
   level:
-    com.flashticket.authservice.mapper: DEBUG
+    com.flashticket.ticketservice.mapper: DEBUG
+
 
 management:
   endpoints:
