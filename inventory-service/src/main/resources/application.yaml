@@ -1,3 +1,9 @@
+server:
+  port: 8083
+
 spring:
   application:
     name: inventory-service
+
+ticket-service:
+  base-url: http://localhost:8082

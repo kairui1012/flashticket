@@ -253,6 +253,151 @@ API Gateway also uses Redis to limit each authenticated user to a replenish rate
 
 API Gateway 还会通过 Redis 按已登录用户进行限流：每秒补充 5 个请求额度，最大突发容量为 10。
 
+## Redis performance check / Redis 性能测试
+
+This is a real HTTP comparison, not a unit test. Send requests directly to Ticket Service on port `8082` so that Gateway authentication and rate limiting do not affect the timing.
+
+这是一个真实 HTTP 性能对比，不是单元测试。测试时直接访问 `8082` 的 Ticket Service，避免 Gateway 鉴权和限流影响测量结果。
+
+Before starting, make sure MySQL and Redis are running, start Ticket Service, and prepare an existing Ticket ID:
+
+开始前请确认 MySQL 和 Redis 正常运行，启动 Ticket Service，并准备一个已经存在的 Ticket ID：
+
+```bash
+docker compose up -d mysql redis
+
+cd ticket-service
+./mvnw spring-boot:run
+```
+
+### Quick comparison / 快速对比
+
+Open another terminal from the repository root and replace the example ID:
+
+打开另一个终端，并将示例 ID 替换为真实的 Ticket ID：
+
+```bash
+TICKET_ID='replace-with-a-real-ticket-id'
+TICKET_URL="http://localhost:8082/api/v1/tickets/$TICKET_ID"
+```
+
+Delete the cache and send the first request. This request must read from MySQL and then write the result to Redis:
+
+先删除缓存并发送第一次请求。该请求会查询 MySQL，然后将结果写入 Redis：
+
+```bash
+docker exec flashticket-redis redis-cli DEL "ticket:$TICKET_ID"
+curl -sS -o /dev/null -w 'cache_miss=%{time_total}s\n' "$TICKET_URL"
+```
+
+Send the same request again without deleting the key. This request should read from Redis:
+
+不要删除 Key，直接发送相同请求。该请求应该从 Redis 读取：
+
+```bash
+curl -sS -o /dev/null -w 'cache_hit=%{time_total}s\n' "$TICKET_URL"
+```
+
+Confirm that the cache exists and inspect its remaining TTL:
+
+确认缓存已经存在，并查看剩余 TTL：
+
+```bash
+docker exec flashticket-redis redis-cli EXISTS "ticket:$TICKET_ID"
+docker exec flashticket-redis redis-cli TTL "ticket:$TICKET_ID"
+```
+
+Expected results:
+
+- `EXISTS` returns `1`.
+- `TTL` returns a value close to `600` seconds.
+- The first request produces a MyBatis `SELECT` in the Ticket Service log.
+- The second request does not produce another Ticket `SELECT` because it is served by Redis.
+- The second request is normally faster, but a single request can be affected by JVM warm-up and operating-system scheduling.
+
+预期结果：
+
+- `EXISTS` 返回 `1`。
+- `TTL` 返回接近 `600` 秒的数值。
+- 第一次请求会在 Ticket Service 日志中产生 MyBatis `SELECT`。
+- 第二次请求由 Redis 返回，不会再次产生 Ticket `SELECT`。
+- 第二次请求通常更快，但单次结果可能受到 JVM 预热及系统调度影响。
+
+### Repeated benchmark / 多次统计测试
+
+Use multiple samples for a more reliable comparison. The Redis deletion command is completed before timing each cache-miss HTTP request, so Docker command time is not included in the measurement.
+
+为了得到更可靠的结果，可以进行多次采样。每次缓存未命中测试都会先完成 Redis 删除，再开始计算 HTTP 请求时间，因此 Docker 命令本身不会计入结果。
+
+```bash
+TICKET_ID='replace-with-a-real-ticket-id'
+TICKET_URL="http://localhost:8082/api/v1/tickets/$TICKET_ID"
+MISS_RESULTS=$(mktemp /tmp/flashticket-cache-miss.XXXXXX)
+HIT_RESULTS=$(mktemp /tmp/flashticket-cache-hit.XXXXXX)
+
+# Warm up the servlet and JVM paths before collecting results.
+for run in {1..10}; do
+  curl -sS -o /dev/null "$TICKET_URL"
+done
+
+# 40 cache misses: delete the exact key before every request.
+for run in {1..40}; do
+  docker exec flashticket-redis redis-cli DEL "ticket:$TICKET_ID" >/dev/null
+  curl -sS -o /dev/null -w '%{time_total}\n' "$TICKET_URL" >> "$MISS_RESULTS"
+done
+
+# Warm the cache once, then collect 100 cache-hit requests.
+curl -sS -o /dev/null "$TICKET_URL"
+for run in {1..100}; do
+  curl -sS -o /dev/null -w '%{time_total}\n' "$TICKET_URL" >> "$HIT_RESULTS"
+done
+
+print_stats() {
+  sort -n "$1" | awk -v label="$2" '
+    { values[NR]=$1; total+=$1 }
+    END {
+      p50=values[int((NR-1)*0.50)+1]
+      p95=values[int((NR-1)*0.95)+1]
+      printf "%s count=%d avg=%.3fms p50=%.3fms p95=%.3fms\n", \
+        label, NR, (total/NR)*1000, p50*1000, p95*1000
+    }'
+}
+
+print_stats "$MISS_RESULTS" 'cache_miss'
+print_stats "$HIT_RESULTS" 'cache_hit '
+
+MISS_AVG=$(awk '{total+=$1} END {print total/NR}' "$MISS_RESULTS")
+HIT_AVG=$(awk '{total+=$1} END {print total/NR}' "$HIT_RESULTS")
+awk -v miss="$MISS_AVG" -v hit="$HIT_AVG" 'BEGIN {
+  printf "speedup=%.2fx latency_reduction=%.1f%%\n", \
+    miss/hit, (1-hit/miss)*100
+}'
+
+rm -f "$MISS_RESULTS" "$HIT_RESULTS"
+```
+
+Example result measured locally on September 19, 2026. Results will vary between machines:
+
+2026 年 9 月 19 日的本机实测示例。不同电脑的结果会有所差异：
+
+```text
+cache_miss count=40  avg=7.626ms p50=7.574ms p95=9.177ms
+cache_hit  count=100 avg=3.901ms p50=3.618ms p95=4.603ms
+speedup=1.95x latency_reduction=48.8%
+```
+
+For an event-list cache, use the same procedure with the following URL and Redis key:
+
+活动票种列表缓存也可以使用相同方法，只需要替换 URL 和 Redis Key：
+
+```bash
+EVENT_ID='replace-with-a-real-event-id'
+EVENT_URL="http://localhost:8082/api/v1/tickets/event/$EVENT_ID"
+docker exec flashticket-redis redis-cli DEL "tickets:event:$EVENT_ID"
+curl -sS -o /dev/null -w 'event_cache_miss=%{time_total}s\n' "$EVENT_URL"
+curl -sS -o /dev/null -w 'event_cache_hit=%{time_total}s\n' "$EVENT_URL"
+```
+
 ## Manual smoke check / 手动快速检查
 
 After all three Java services are running:

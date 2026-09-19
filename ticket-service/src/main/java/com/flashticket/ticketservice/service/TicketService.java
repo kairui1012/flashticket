@@ -1,5 +1,15 @@
 package com.flashticket.ticketservice.service;
 
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.UUID;
+
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+
 import com.flashticket.ticketservice.dto.CreateTicketRequest;
 import com.flashticket.ticketservice.dto.TicketResponse;
 import com.flashticket.ticketservice.dto.UpdateTicketRequest;
@@ -7,45 +17,53 @@ import com.flashticket.ticketservice.entity.Ticket;
 import com.flashticket.ticketservice.entity.TicketStatus;
 import com.flashticket.ticketservice.exception.TicketBusinessException;
 import com.flashticket.ticketservice.mapper.TicketMapper;
-import lombok.RequiredArgsConstructor;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.http.HttpStatus;
-import org.springframework.stereotype.Service;
 
-import java.time.Duration;
-import java.time.LocalDateTime;
-import java.util.List;
-import java.util.UUID;
+import lombok.RequiredArgsConstructor;
 
 @RequiredArgsConstructor
 @Service
 public class TicketService {
 
     private static final Duration CACHE_TTL = Duration.ofMinutes(10);
-
+    private static final Duration NOT_FOUND_CACHE_TTL = Duration.ofSeconds(30);
     private final TicketMapper ticketMapper;
     private final RedisTemplate<String, Object> redisTemplate;
+    private final StringRedisTemplate stringRedisTemplate;
 
     public TicketResponse getTicketById(String id) {
 
         String key = ticketCacheKey(id);
         Object cached = redisTemplate.opsForValue().get(key);
 
-        // Cache hit: return the ticket directly without querying MySQL.
+        // Positive cache: return an existing ticket without querying MySQL.
         if (cached instanceof TicketResponse ticketResponse) {
             return ticketResponse;
+        }
+
+        String notFoundKey = ticketNotFoundCacheKey(id);
+        String cachedNotFound = stringRedisTemplate.opsForValue().get(notFoundKey);
+
+        // Negative cache: avoid repeated database queries for a missing ticket ID.
+        if ("NOT_FOUND".equals(cachedNotFound)) {
+            throw ticketNotFound(id);
         }
 
         Ticket ticket = ticketMapper.findById(id);
 
         if (ticket == null) {
+            // Cache the missing result briefly to prevent cache penetration.
+            stringRedisTemplate.opsForValue().set(
+                    notFoundKey,
+                    "NOT_FOUND",
+                    NOT_FOUND_CACHE_TTL
+            );
             throw ticketNotFound(id);
         }
 
         TicketResponse response = mapToResponse(ticket);
 
 
-        // Cache miss: save the database result for later requests.
+        // Database hit: cache the ticket for later successful lookups.
         redisTemplate.opsForValue().set(key, response, CACHE_TTL);
 
         return response;
@@ -96,6 +114,7 @@ public class TicketService {
 
         // A newly created ticket changes the cached list for its event.
         redisTemplate.delete(eventTicketsCacheKey(ticket.getEventId()));
+        stringRedisTemplate.delete(ticketNotFoundCacheKey(ticket.getId()));
         return mapToResponse(ticket);
     }
 
@@ -142,6 +161,7 @@ public class TicketService {
 
         // Keep the single-ticket cache fresh and invalidate the event list.
         redisTemplate.opsForValue().set(ticketCacheKey(id), response, CACHE_TTL);
+        stringRedisTemplate.delete(ticketNotFoundCacheKey(id));
         redisTemplate.delete(eventTicketsCacheKey(updatedTicket.getEventId()));
 
         return response;
@@ -180,6 +200,7 @@ public class TicketService {
 
         // Cancellation changes both the ticket details and its event list.
         redisTemplate.opsForValue().set(ticketCacheKey(id), response, CACHE_TTL);
+        stringRedisTemplate.delete(ticketNotFoundCacheKey(id));
         redisTemplate.delete(eventTicketsCacheKey(updatedTicket.getEventId()));
 
         return response;
@@ -211,6 +232,10 @@ public class TicketService {
 
     private String eventTicketsCacheKey(String eventId) {
         return "tickets:event:" + eventId;
+    }
+
+    private String ticketNotFoundCacheKey(String id) {
+        return "ticket:not-found:" + id;
     }
 
     private TicketResponse mapToResponse(Ticket ticket) {

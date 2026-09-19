@@ -25,8 +25,10 @@ public class SecurityConfig {
 
         http.authorizeExchange(auth -> auth
                 .pathMatchers("/api/v1/auth/login", "/api/v1/auth/register").permitAll()
-                .pathMatchers(HttpMethod.POST, "/api/v1/tickets/**").hasRole("ADMIN")
-                .pathMatchers("/api/v1/tickets/**").hasAnyRole("USER", "ADMIN")
+                .pathMatchers(HttpMethod.GET, "/api/v1/tickets/**",
+                        "/api/v1/inventory/**").hasAnyRole("USER", "ADMIN")
+                .pathMatchers("/api/v1/tickets/**", "/api/v1/inventory/**")
+                .hasRole("ADMIN")
                 .anyExchange().authenticated());
 
         http.oauth2ResourceServer(oAuth2ResourceServerSpec -> oAuth2ResourceServerSpec.jwt(

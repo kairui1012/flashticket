@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.flashticket.inventoryservice.mapper.InventoryMapper">
+
+    <resultMap id="InventoryResultMap"
+               type="com.flashticket.inventoryservice.entity.Inventory">
+        <id property="id" column="id"/>
+        <result property="ticketId" column="ticket_id"/>
+        <result property="totalStock" column="total_stock"/>
+        <result property="availableStock" column="available_stock"/>
+        <result property="reservedStock" column="reserved_stock"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <insert id="insert">
+        INSERT INTO inventories (
+            id, ticket_id, total_stock, available_stock, reserved_stock, created_at, updated_at
+        ) VALUES (
+            #{id}, #{ticketId}, #{totalStock}, #{availableStock}, #{reservedStock},
+            #{createdAt}, #{updatedAt}
+        )
+    </insert>
+
+    <select id="findByTicketId" resultMap="InventoryResultMap">
+        SELECT *
+        FROM inventories
+        WHERE ticket_id = #{ticketId}
+    </select>
+
+    <update id="updateAvailableStock">
+        UPDATE inventories
+        SET available_stock = #{availableStock},
+            updated_at = NOW()
+        WHERE ticket_id = #{ticketId}
+    </update>
+
+    <update id="increaseStock">
+        UPDATE inventories
+        SET available_stock = available_stock + #{quantity},
+            updated_at = NOW()
+        WHERE ticket_id = #{ticketId}
+    </update>
+
+    <update id="decreaseStock">
+        UPDATE inventories
+        SET available_stock = available_stock - #{quantity},
+            updated_at = NOW()
+        WHERE ticket_id = #{ticketId}
+          AND available_stock >= #{quantity}
+    </update>
+
+    <update id="reserveStock">
+        UPDATE inventories
+        SET available_stock = available_stock - #{quantity},
+            reserved_stock = reserved_stock + #{quantity},
+            updated_at = NOW()
+        WHERE ticket_id = #{ticketId}
+          AND available_stock >= #{quantity}
+    </update>
+
+    <update id="releaseStock">
+        UPDATE inventories
+        SET available_stock = available_stock + #{quantity},
+            reserved_stock = reserved_stock - #{quantity},
+            updated_at = NOW()
+        WHERE ticket_id = #{ticketId}
+          AND reserved_stock >= #{quantity}
+    </update>
+
+</mapper>

@@ -24,6 +24,10 @@ spring:
                     key-resolver: "#{@userKeyResolver}"
                     redis-rate-limiter.replenishRate: 5
                     redis-rate-limiter.burstCapacity: 10
+            - id: inventory-service
+              uri: http://localhost:8083
+              predicates:
+                - Path=/api/v1/inventory/**
     
 server:
   port: 8080
