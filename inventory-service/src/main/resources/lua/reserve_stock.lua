@@ -1,16 +1,17 @@
---Lua:
---1. 检查 stock key 存不存在
---2. 检查用户是否已经 reserve
---3. 检查 availableStock >= quantity
---4. DECRBY stock
---5. SET reservation
---6. return 状态码
+-- Lua reservation flow:
+-- 1. Check whether the stock key exists.
+-- 2. Check whether the user has already reserved stock.
+-- 3. Check whether availableStock is greater than or equal to quantity.
+-- 4. Decrease the available stock using DECRBY.
+-- 5. Store the user's reservation.
+-- 6. Return the corresponding status code.
 
---1 = reserve 成功
---0 = 库存不足
----1 = stock key 不存在
----2 = 用户已经 reserve
----3 = quantity 非法
+-- Return codes:
+-- 1 = Reservation succeeded.
+-- 0 = Insufficient stock.
+-- -1 = The stock key does not exist.
+-- -2 = The user has already reserved stock.
+-- -3 = The requested quantity is invalid.
 
 local stockKey = KEYS[1]
 local reservationKey = KEYS[2]
