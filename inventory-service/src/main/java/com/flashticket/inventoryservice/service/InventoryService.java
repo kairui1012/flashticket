@@ -1,10 +1,12 @@
 package com.flashticket.inventoryservice.service;
 
 import com.flashticket.inventoryservice.client.TicketClient;
+import com.flashticket.inventoryservice.config.RedisConfig;
 import com.flashticket.inventoryservice.dto.InventoryResponse;
 import com.flashticket.inventoryservice.dto.InsertInventoryRequest;
 import com.flashticket.inventoryservice.dto.ReleaseStockRequest;
 import com.flashticket.inventoryservice.dto.ReserveStockRequest;
+import com.flashticket.inventoryservice.dto.TicketScheduleResponse;
 import com.flashticket.inventoryservice.entity.Inventory;
 import com.flashticket.inventoryservice.mapper.InventoryMapper;
 import lombok.RequiredArgsConstructor;
@@ -16,6 +18,8 @@ import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 
 @Service
@@ -23,17 +27,38 @@ import java.util.UUID;
 
 public class InventoryService {
 
-    // Both the inventory detail cache and the stock counter expire after 10 minutes.
+    // Complete inventory-detail cache entries expire after 10 minutes.
     private static final Duration CACHE_TTL = Duration.ofMinutes(10);
+
+    // Missing-inventory markers expire quickly so newly created records can become visible.
     private static final Duration NOT_FOUND_CACHE_TTL = Duration.ofSeconds(30);
+
+    // Blocks manual stock changes starting 10 minutes before ticket sales begin.
+    private static final Duration STOCK_CHANGE_LOCK_WINDOW = Duration.ofMinutes(10);
 
     private final InventoryMapper inventoryMapper;
     private final RedisTemplate<String,InventoryResponse> redisTemplate;
+
+    // Manages flash-sale inventory keys and uses Lua to check and deduct stock atomically in Redis.
     private final StringRedisTemplate stringRedisTemplate;
 
     private final TicketClient ticketClient;
+    private final RedisConfig redisConfig;
 
-    // Creates the initial inventory record after confirming the ticket exists.
+    /**
+     * Creates the initial inventory for a ticket.
+     *
+     * STEP 1 -> Confirm that the ticket exists in the ticket service.
+     * STEP 2 -> Check that inventory has not already been created for the ticket.
+     * STEP 3 -> Create the inventory with total and available stock set to the requested amount.
+     * STEP 4 -> Save the new inventory record in MySQL.
+     * STEP 5 -> Cache the inventory response and clear any previous not-found marker.
+     * STEP 6 -> Initialize the Redis available-stock counter used by the reservation flow.
+     *
+     * @param request the ticket ID and initial total stock
+     * @return the newly created inventory
+     * @throws ResponseStatusException if the ticket does not exist or inventory already exists
+     */
     public InventoryResponse insert(InsertInventoryRequest request) {
 
         if (!ticketClient.existsById(request.getTicketId())) {
@@ -69,19 +94,18 @@ public class InventoryService {
 
         InventoryResponse response = mapToResponse(inventory);
 
-        // Cache the complete inventory record for ordinary inventory reads.
+        // Cache the inventory response used by ordinary read requests.
         redisTemplate.opsForValue().set(
-                inventoryCacheKey("",inventory.getTicketId()),
+                inventoryDetailKey(inventory.getTicketId()),
                 response,
                 CACHE_TTL
         );
         stringRedisTemplate.delete(inventoryNotFoundCacheKey(inventory.getTicketId()));
 
-        // Store only the available amount for fast stock checks.
+        // Initialize the Redis counter used for fast available-stock checks.
         stringRedisTemplate.opsForValue().set(
-                inventoryCacheKey("stock",inventory.getTicketId()),
-                String.valueOf(inventory.getAvailableStock()),
-                CACHE_TTL
+                inventoryStockKey(inventory.getTicketId()),
+                String.valueOf(inventory.getAvailableStock())
         );
 
         return response;
@@ -90,7 +114,7 @@ public class InventoryService {
     // Gets one inventory record, preferring the Redis cache before MySQL.
     public InventoryResponse findByTicketId(String ticketId) {
 
-        String key = inventoryCacheKey("", ticketId);
+        String key = inventoryDetailKey(ticketId);
 
         InventoryResponse cached =
                 redisTemplate.opsForValue().get(key);
@@ -147,10 +171,12 @@ public class InventoryService {
             );
         }
 
-        if (availableStock < 0) {
+        ensureStockCanBeModified(ticketId);
+
+        if (availableStock == null || availableStock < 0) {
             throw new ResponseStatusException(
                     HttpStatus.BAD_REQUEST,
-                    "Available stock cannot be negative"
+                    "Available stock cannot be null or negative"
             );
         }
 
@@ -169,18 +195,17 @@ public class InventoryService {
         inventory.setAvailableStock(availableStock);
         inventory.setUpdatedAt(LocalDateTime.now());
 
-        // Refresh the fast available-stock cache after a manual update.
+        // Synchronize the Redis available-stock counter after a manual update.
         stringRedisTemplate.opsForValue().set(
-                inventoryCacheKey("stock", ticketId),
-                String.valueOf(availableStock),
-                CACHE_TTL
+                inventoryStockKey(ticketId),
+                String.valueOf(availableStock)
         );
 
         InventoryResponse response = mapToResponse(inventory);
 
-        // Refresh the complete inventory cache after a manual update.
+        // Refresh the inventory-detail cache after a manual update.
         redisTemplate.opsForValue().set(
-                inventoryCacheKey("", ticketId),
+                inventoryDetailKey(ticketId),
                 response,
                 CACHE_TTL
         );
@@ -189,7 +214,7 @@ public class InventoryService {
         return response;
     }
 
-    // Adds new stock to both the total and available quantities.
+    // Increases available stock and recalculates total stock in the returned response.
     public InventoryResponse increaseAvailableStock(String ticketId, Integer quantity) {
 
         if (quantity == null || quantity <= 0) {
@@ -208,6 +233,8 @@ public class InventoryService {
             );
         }
 
+        ensureStockCanBeModified(ticketId);
+
         int newTotalStock = inventory.getTotalStock() + quantity;
         int newAvailableStock = inventory.getAvailableStock() + quantity;
 
@@ -220,22 +247,21 @@ public class InventoryService {
         InventoryResponse response = mapToResponse(inventory);
 
         redisTemplate.opsForValue().set(
-                inventoryCacheKey("", ticketId),
+                inventoryDetailKey(ticketId),
                 response,
                 CACHE_TTL
         );
         stringRedisTemplate.delete(inventoryNotFoundCacheKey(ticketId));
 
         stringRedisTemplate.opsForValue().set(
-                inventoryCacheKey("stock", ticketId),
-                String.valueOf(newAvailableStock),
-                CACHE_TTL
+                inventoryStockKey(ticketId),
+                String.valueOf(newAvailableStock)
         );
 
         return response;
     }
 
-    // Permanently removes stock from both the total and available quantities.
+    // Decreases available stock and recalculates total stock in the returned response.
     public InventoryResponse decreaseAvailableStock(String ticketId, Integer quantity) {
 
         if (quantity == null || quantity <= 0) {
@@ -253,6 +279,8 @@ public class InventoryService {
                     "Inventory not found for ticket: " + ticketId
             );
         }
+
+        ensureStockCanBeModified(ticketId);
 
         if (inventory.getAvailableStock() < quantity) {
             throw new ResponseStatusException(
@@ -273,35 +301,90 @@ public class InventoryService {
         InventoryResponse response = mapToResponse(inventory);
 
         redisTemplate.opsForValue().set(
-                inventoryCacheKey("", ticketId),
+                inventoryDetailKey(ticketId),
                 response,
                 CACHE_TTL
         );
         stringRedisTemplate.delete(inventoryNotFoundCacheKey(ticketId));
 
         stringRedisTemplate.opsForValue().set(
-                inventoryCacheKey("stock", ticketId),
-                String.valueOf(newAvailableStock),
+                inventoryStockKey(ticketId),
+                String.valueOf(newAvailableStock)
+        );
+
+        return response;
+    }
+
+    /*
+     * Reservation flow expected by this Java method:
+     * 1. Build the Redis keys for available stock and the user's reservation.
+     * 2. Pass both keys and the requested quantity to the Lua script.
+     * 3. The Lua script must read, validate, and deduct available stock atomically.
+     * 4. Treat only a Lua return value of 1 as a successful reservation.
+     * 5. Read the remaining available stock from Redis.
+     * 6. Update the response and refresh the inventory detail cache.
+     *
+     * Lua arguments:
+     * KEYS[1] = available-stock key
+     * KEYS[2] = stock reserved by this user for this ticket
+     * ARGV[1] = quantity requested by the user
+     */
+    public InventoryResponse reserveStock(ReserveStockRequest request) {
+        String stockKey = inventoryStockKey(request.getTicketId());
+
+        Long result = stringRedisTemplate.execute(
+                redisConfig.reserveStockScript(),
+                List.of(
+                        stockKey,
+                        inventoryReservedKey(request.getTicketId(), request.getUserId())
+                ),
+                String.valueOf(request.getReservedStock())
+        );
+
+        if (!Objects.equals(result, 1L)) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Unable to reserve the requested stock"
+            );
+        }
+
+        InventoryResponse response = findByTicketId(request.getTicketId());
+
+        String availableStock = stringRedisTemplate.opsForValue().get(stockKey);
+
+        if (availableStock == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Stock cache is missing after reservation"
+            );
+        }
+
+        response.setAvailableStock(Integer.valueOf(availableStock));
+        response.setUpdatedAt(LocalDateTime.now());
+
+        redisTemplate.opsForValue().set(
+                inventoryDetailKey(request.getTicketId()),
+                response,
                 CACHE_TTL
         );
 
         return response;
     }
 
-    public InventoryResponse reserveStock(ReserveStockRequest request) {
-    }
-
     public InventoryResponse releaseStock(ReleaseStockRequest request) {
     }
 
-    private String inventoryCacheKey(String text, String id) {
-        if (text == null || text.isBlank()) {
-            return "inventory:" + id;
-        }
-
-        return "inventory:" + text + ":" + id;
+    // Identifies the cached inventory response: inventory:{ticketId}
+    private String inventoryDetailKey(String ticketId) {
+        return "inventory:" + ticketId;
     }
 
+    // Identifies the available-stock counter used by the reservation script.
+    private String inventoryStockKey(String ticketId) {
+        return "inventory:stock:" + ticketId;
+    }
+
+    // Identifies the temporary missing-inventory marker used to reduce database lookups.
     private String inventoryNotFoundCacheKey(String ticketId) {
         return "inventory:not-found:" + ticketId;
     }
@@ -311,6 +394,37 @@ public class InventoryService {
                 HttpStatus.NOT_FOUND,
                 "Inventory not found for ticket: " + ticketId
         );
+    }
+
+    /*
+     * Manual stock changes are allowed only before the lock window begins.
+     * Once the current time reaches saleStartTime minus 10 minutes, update,
+     * increase, and decrease operations remain blocked.
+     */
+    private void ensureStockCanBeModified(String ticketId) {
+        TicketScheduleResponse ticket = ticketClient.getTicketById(ticketId);
+        LocalDateTime saleStartTime = ticket.getSaleStartTime();
+
+        if (saleStartTime == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Ticket sale start time is not configured"
+            );
+        }
+
+        LocalDateTime lockTime = saleStartTime.minus(STOCK_CHANGE_LOCK_WINDOW);
+
+        if (!LocalDateTime.now().isBefore(lockTime)) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Stock cannot be changed from 10 minutes before the ticket sale start time onward"
+            );
+        }
+    }
+
+    // Identifies one user's reserved quantity for a ticket.
+    private String inventoryReservedKey(String ticketId,String userId){
+        return "inventory:reserved:" + ticketId + ":" + userId;
     }
 
     private InventoryResponse mapToResponse(Inventory inventory) {
