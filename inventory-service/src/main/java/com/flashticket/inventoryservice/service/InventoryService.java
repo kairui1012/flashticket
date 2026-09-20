@@ -8,13 +8,16 @@ import com.flashticket.inventoryservice.dto.ReleaseStockRequest;
 import com.flashticket.inventoryservice.dto.ReserveStockRequest;
 import com.flashticket.inventoryservice.dto.TicketScheduleResponse;
 import com.flashticket.inventoryservice.entity.Inventory;
+import com.flashticket.inventoryservice.event.InventoryReservedEvent;
 import com.flashticket.inventoryservice.mapper.InventoryMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpStatus;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
+
 
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -44,6 +47,9 @@ public class InventoryService {
 
     private final TicketClient ticketClient;
     private final RedisConfig redisConfig;
+
+    private final KafkaTemplate<String,Object> kafkaTemplate;
+    private static final String RESERVED_TOPIC = "inventory.reserved";
 
     /**
      * Creates the initial inventory for a ticket.
@@ -316,22 +322,18 @@ public class InventoryService {
     }
 
     /*
-     * Reservation flow expected by this Java method:
-     * 1. Build the Redis keys for available stock and the user's reservation.
-     * 2. Pass both keys and the requested quantity to the Lua script.
-     * 3. The Lua script must read, validate, and deduct available stock atomically.
-     * 4. Treat only a Lua return value of 1 as a successful reservation.
-     * 5. Read the remaining available stock from Redis.
-     * 6. Update the response and refresh the inventory detail cache.
-     *
+     * Reserves stock by executing the Redis Lua script atomically.
      * Lua arguments:
      * KEYS[1] = available-stock key
      * KEYS[2] = stock reserved by this user for this ticket
      * ARGV[1] = quantity requested by the user
      */
     public InventoryResponse reserveStock(ReserveStockRequest request) {
+        // STEP 1 -> Build the Redis key that stores the ticket's available stock.
         String stockKey = inventoryStockKey(request.getTicketId());
 
+        // STEP 2 -> Execute Lua with the stock key, user reservation key, and requested quantity.
+        // Lua validates the request and deducts the stock atomically inside Redis.
         Long result = stringRedisTemplate.execute(
                 redisConfig.reserveStockScript(),
                 List.of(
@@ -341,6 +343,7 @@ public class InventoryService {
                 String.valueOf(request.getReservedStock())
         );
 
+        // STEP 3 -> Continue only when Lua returns 1, which means the reservation succeeded.
         if (!Objects.equals(result, 1L)) {
             throw new ResponseStatusException(
                     HttpStatus.CONFLICT,
@@ -348,10 +351,13 @@ public class InventoryService {
             );
         }
 
+        // STEP 4 -> Load the inventory details needed to build the API response.
         InventoryResponse response = findByTicketId(request.getTicketId());
 
+        // STEP 5 -> Read the remaining available stock after Lua has deducted the quantity.
         String availableStock = stringRedisTemplate.opsForValue().get(stockKey);
 
+        // STEP 6 -> Fail if the stock key unexpectedly disappeared after a successful reservation.
         if (availableStock == null) {
             throw new ResponseStatusException(
                     HttpStatus.INTERNAL_SERVER_ERROR,
@@ -359,15 +365,36 @@ public class InventoryService {
             );
         }
 
+        // STEP 7 -> Put the latest Redis stock value into the response.
         response.setAvailableStock(Integer.valueOf(availableStock));
         response.setUpdatedAt(LocalDateTime.now());
 
+        // STEP 8 -> Refresh the inventory-detail cache with the latest response data.
         redisTemplate.opsForValue().set(
                 inventoryDetailKey(request.getTicketId()),
                 response,
                 CACHE_TTL
         );
 
+        // STEP 9 -> Create a unique reservation event for downstream database synchronization.
+        // eventId allows the consumer to implement idempotency when Kafka redelivers a message.
+        InventoryReservedEvent event = new InventoryReservedEvent(
+                UUID.randomUUID().toString(),
+                request.getTicketId(),
+                request.getUserId(),
+                request.getReservedStock(),
+                LocalDateTime.now()
+        );
+
+        // STEP 10 -> Submit the event to Kafka asynchronously.
+        // ticketId is the message key so events for the same ticket keep partition ordering.
+        kafkaTemplate.send(
+                RESERVED_TOPIC,
+                request.getTicketId(),
+                event
+        );
+
+        // STEP 11 -> Return after the Kafka send has been submitted, without waiting for acknowledgement.
         return response;
     }
 

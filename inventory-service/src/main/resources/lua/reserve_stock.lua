@@ -3,7 +3,7 @@
 -- 2. Check whether the user has already reserved stock.
 -- 3. Check whether availableStock is greater than or equal to quantity.
 -- 4. Decrease the available stock using DECRBY.
--- 5. Store the user's reservation.
+-- 5. Store the user's reservation with a five-minute expiration.
 -- 6. Return the corresponding status code.
 
 -- Return codes:
@@ -16,6 +16,7 @@
 local stockKey = KEYS[1]
 local reservationKey = KEYS[2]
 local quantity = tonumber(ARGV[1])
+local reservationTtlSeconds = 300
 
 if not quantity or quantity <= 0 then
     return -3
@@ -41,6 +42,5 @@ end
 
 redis.call("DECRBY", stockKey, quantity)
 
-redis.call("SET", reservationKey, quantity)
-
+redis.call("SET", reservationKey, quantity, "EX", reservationTtlSeconds)
 return 1

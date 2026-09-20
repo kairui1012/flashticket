@@ -11,7 +11,7 @@ public class RedisConfig {
     @Bean
     public DefaultRedisScript<Long> reserveStockScript(){
         DefaultRedisScript<Long> script = new DefaultRedisScript<>();
-        script.setLocation(new ClassPathResource("resources/lua/reserve_stock.lua"));
+        script.setLocation(new ClassPathResource("lua/reserve_stock.lua"));
         script.setResultType(Long.class);
         return script;
     }
