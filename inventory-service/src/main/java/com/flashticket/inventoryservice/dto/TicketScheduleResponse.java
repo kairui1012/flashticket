@@ -8,4 +8,6 @@ import java.time.LocalDateTime;
 public class TicketScheduleResponse {
     private String id;
     private LocalDateTime saleStartTime;
+    private LocalDateTime saleEndTime;
+    private String status;
 }

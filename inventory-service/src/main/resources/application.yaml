@@ -1,9 +1,86 @@
 server:
-  port: 8083
+  port: ${INVENTORY_SERVICE_PORT:8083}
 
 spring:
+  flyway:
+    # Enables Flyway migrations when Inventory Service starts.
+    enabled: true
+
+    # Loads versioned SQL migrations from src/main/resources/db/migration.
+    locations: classpath:db/migration
+
+    # Validates the versions and checksums of applied migrations before running pending ones.
+    validate-on-migrate: true
+
+    # Prevents Flyway clean from deleting all objects in this database schema.
+    clean-disabled: true
+
+    # Allows Flyway to adopt the current database when it already contains tables.
+    baseline-on-migrate: true
+
+    # Uses version 0 as the baseline so V1 and later migrations still run.
+    baseline-version: "0"
+
+    # Keeps Inventory migration records separate while multiple services share this database.
+    table: flyway_inventory_schema_history
+
   application:
     name: inventory-service
 
+  datasource:
+    url: ${INVENTORY_DB_URL:jdbc:mysql://localhost:3307/flashticket_auth?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Kuala_Lumpur}
+    username: ${INVENTORY_DB_USERNAME:root}
+    password: ${INVENTORY_DB_PASSWORD:root}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2s
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 10
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        spring.json.add.type.headers: true
+
+    consumer:
+      group-id: inventory-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: com.flashticket.inventoryservice.event
+        spring.json.use.type.headers: true
+
+    listener:
+      ack-mode: record
+
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+
 ticket-service:
-  base-url: http://localhost:8082
+  base-url: ${TICKET_SERVICE_BASE_URL:http://localhost:8082}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include:
+          - health
+          - info
+
+logging:
+  level:
+    com.flashticket.inventoryservice.mapper: DEBUG

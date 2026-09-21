@@ -2,6 +2,28 @@ server:
   port: 8081
 
 spring:
+  flyway:
+    # Enables Flyway migrations when Auth Service starts.
+    enabled: true
+
+    # Loads versioned SQL migrations from src/main/resources/db/migration.
+    locations: classpath:db/migration
+
+    # Validates the versions and checksums of applied migrations before running pending ones.
+    validate-on-migrate: true
+
+    # Prevents Flyway clean from deleting all objects in this database schema.
+    clean-disabled: true
+
+    # Allows Flyway to adopt the current database when it already contains tables.
+    baseline-on-migrate: true
+
+    # Uses version 0 as the baseline so V1 still runs after an existing database is adopted.
+    baseline-version: "0"
+
+    # Keeps Auth migration records separate while multiple services share this database.
+    table: flyway_auth_schema_history
+
   application:
     name: auth-service
 
@@ -11,11 +33,6 @@ spring:
     password: root
     driver-class-name: com.mysql.cj.jdbc.Driver
 
-  sql:
-    init:
-      mode: always
-      schema-locations: classpath:schema.sql
-
 mybatis:
   mapper-locations: classpath:mapper/*.xml
 
@@ -23,8 +40,10 @@ mybatis:
     map-underscore-to-camel-case: true
 
 jwt:
-  private-key: file:../keys/private.pem
-  public-key: file:../keys/public.pem
+  # Defaults to the repository-level keys directory when started from the project root.
+  # Production deployments should override these values with mounted secret file paths.
+  private-key: ${JWT_PRIVATE_KEY:file:keys/private.pem}
+  public-key: ${JWT_PUBLIC_KEY:file:keys/public.pem}
   
 logging:
   level:

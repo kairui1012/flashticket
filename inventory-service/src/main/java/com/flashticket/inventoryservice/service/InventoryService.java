@@ -244,7 +244,14 @@ public class InventoryService {
         int newTotalStock = inventory.getTotalStock() + quantity;
         int newAvailableStock = inventory.getAvailableStock() + quantity;
 
-        inventoryMapper.increaseStock(ticketId, quantity);
+        int updatedRows = inventoryMapper.increaseStock(ticketId, quantity);
+
+        if (updatedRows != 1) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Unable to increase inventory stock"
+            );
+        }
 
         inventory.setTotalStock(newTotalStock);
         inventory.setAvailableStock(newAvailableStock);
@@ -298,7 +305,14 @@ public class InventoryService {
         int newTotalStock = inventory.getTotalStock() - quantity;
         int newAvailableStock = inventory.getAvailableStock() - quantity;
 
-        inventoryMapper.decreaseStock(ticketId, quantity);
+        int updatedRows = inventoryMapper.decreaseStock(ticketId, quantity);
+
+        if (updatedRows != 1) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Unable to decrease inventory stock"
+            );
+        }
 
         inventory.setTotalStock(newTotalStock);
         inventory.setAvailableStock(newAvailableStock);
@@ -322,17 +336,21 @@ public class InventoryService {
     }
 
     /*
-     * Reserves stock by executing the Redis Lua script atomically.
+     * Validates the ticket sale window and reserves stock by executing the Redis Lua script atomically.
      * Lua arguments:
      * KEYS[1] = available-stock key
      * KEYS[2] = stock reserved by this user for this ticket
      * ARGV[1] = quantity requested by the user
      */
     public InventoryResponse reserveStock(ReserveStockRequest request) {
-        // STEP 1 -> Build the Redis key that stores the ticket's available stock.
+        // STEP 1 -> Confirm that the ticket is currently eligible for reservation.
+        // This check happens before Lua so an invalid sale never changes Redis stock.
+        ensureTicketCanBeReserved(request.getTicketId());
+
+        // STEP 2 -> Build the Redis key that stores the ticket's available stock.
         String stockKey = inventoryStockKey(request.getTicketId());
 
-        // STEP 2 -> Execute Lua with the stock key, user reservation key, and requested quantity.
+        // STEP 3 -> Execute Lua with the stock key, user reservation key, and requested quantity.
         // Lua validates the request and deducts the stock atomically inside Redis.
         Long result = stringRedisTemplate.execute(
                 redisConfig.reserveStockScript(),
@@ -343,7 +361,7 @@ public class InventoryService {
                 String.valueOf(request.getReservedStock())
         );
 
-        // STEP 3 -> Continue only when Lua returns 1, which means the reservation succeeded.
+        // STEP 4 -> Continue only when Lua returns 1, which means the reservation succeeded.
         if (!Objects.equals(result, 1L)) {
             throw new ResponseStatusException(
                     HttpStatus.CONFLICT,
@@ -351,13 +369,13 @@ public class InventoryService {
             );
         }
 
-        // STEP 4 -> Load the inventory details needed to build the API response.
+        // STEP 5 -> Load the inventory details needed to build the API response.
         InventoryResponse response = findByTicketId(request.getTicketId());
 
-        // STEP 5 -> Read the remaining available stock after Lua has deducted the quantity.
+        // STEP 6 -> Read the remaining available stock after Lua has deducted the quantity.
         String availableStock = stringRedisTemplate.opsForValue().get(stockKey);
 
-        // STEP 6 -> Fail if the stock key unexpectedly disappeared after a successful reservation.
+        // STEP 7 -> Fail if the stock key unexpectedly disappeared after a successful reservation.
         if (availableStock == null) {
             throw new ResponseStatusException(
                     HttpStatus.INTERNAL_SERVER_ERROR,
@@ -365,18 +383,20 @@ public class InventoryService {
             );
         }
 
-        // STEP 7 -> Put the latest Redis stock value into the response.
-        response.setAvailableStock(Integer.valueOf(availableStock));
+        // STEP 8 -> Put the latest Redis stock value into the response.
+        int latestAvailableStock = Integer.parseInt(availableStock);
+        response.setAvailableStock(latestAvailableStock);
+        response.setReservedStock(response.getTotalStock() - latestAvailableStock);
         response.setUpdatedAt(LocalDateTime.now());
 
-        // STEP 8 -> Refresh the inventory-detail cache with the latest response data.
+        // STEP 9 -> Refresh the inventory-detail cache with the latest response data.
         redisTemplate.opsForValue().set(
                 inventoryDetailKey(request.getTicketId()),
                 response,
                 CACHE_TTL
         );
 
-        // STEP 9 -> Create a unique reservation event for downstream database synchronization.
+        // STEP 10 -> Create a unique reservation event for downstream database synchronization.
         // eventId allows the consumer to implement idempotency when Kafka redelivers a message.
         InventoryReservedEvent event = new InventoryReservedEvent(
                 UUID.randomUUID().toString(),
@@ -386,7 +406,7 @@ public class InventoryService {
                 LocalDateTime.now()
         );
 
-        // STEP 10 -> Submit the event to Kafka asynchronously.
+        // STEP 11 -> Submit the event to Kafka asynchronously.
         // ticketId is the message key so events for the same ticket keep partition ordering.
         kafkaTemplate.send(
                 RESERVED_TOPIC,
@@ -394,11 +414,12 @@ public class InventoryService {
                 event
         );
 
-        // STEP 11 -> Return after the Kafka send has been submitted, without waiting for acknowledgement.
+        // STEP 12 -> Return after the Kafka send has been submitted, without waiting for acknowledgement.
         return response;
     }
 
     public InventoryResponse releaseStock(ReleaseStockRequest request) {
+
     }
 
     // Identifies the cached inventory response: inventory:{ticketId}
@@ -449,6 +470,58 @@ public class InventoryService {
         }
     }
 
+    /*
+     * Reservations are accepted only while the configured sale window is active.
+     * Terminal ticket statuses always block reservations. DRAFT is allowed during
+     * the time window because Ticket Service does not yet persist an automatic
+     * DRAFT-to-ON_SALE transition.
+     */
+    private void ensureTicketCanBeReserved(String ticketId) {
+        TicketScheduleResponse ticket = ticketClient.getTicketById(ticketId);
+        LocalDateTime saleStartTime = ticket.getSaleStartTime();
+        LocalDateTime saleEndTime = ticket.getSaleEndTime();
+        String status = ticket.getStatus();
+
+        if (saleStartTime == null || saleEndTime == null || status == null || status.isBlank()) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Ticket sale schedule or status is not configured"
+            );
+        }
+
+        if ("CANCELLED".equals(status)
+                || "ENDED".equals(status)
+                || "SOLD_OUT".equals(status)) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Ticket is not available for reservation: " + status
+            );
+        }
+
+        if (!"DRAFT".equals(status) && !"ON_SALE".equals(status)) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Unsupported ticket status: " + status
+            );
+        }
+
+        LocalDateTime now = LocalDateTime.now();
+
+        if (now.isBefore(saleStartTime)) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Ticket sale has not started"
+            );
+        }
+
+        if (!now.isBefore(saleEndTime)) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Ticket sale has ended"
+            );
+        }
+    }
+
     // Identifies one user's reserved quantity for a ticket.
     private String inventoryReservedKey(String ticketId,String userId){
         return "inventory:reserved:" + ticketId + ":" + userId;
@@ -461,6 +534,7 @@ public class InventoryService {
         response.setTicketId(inventory.getTicketId());
         response.setTotalStock(inventory.getTotalStock());
         response.setAvailableStock(inventory.getAvailableStock());
+        response.setReservedStock(inventory.getReservedStock());
         response.setCreatedAt(inventory.getCreatedAt());
         response.setUpdatedAt(inventory.getUpdatedAt());
 

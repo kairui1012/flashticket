@@ -40,14 +40,16 @@
 
     <update id="increaseStock">
         UPDATE inventories
-        SET available_stock = available_stock + #{quantity},
+        SET total_stock = total_stock + #{quantity},
+            available_stock = available_stock + #{quantity},
             updated_at = NOW()
         WHERE ticket_id = #{ticketId}
     </update>
 
     <update id="decreaseStock">
         UPDATE inventories
-        SET available_stock = available_stock - #{quantity},
+        SET total_stock = total_stock - #{quantity},
+            available_stock = available_stock - #{quantity},
             updated_at = NOW()
         WHERE ticket_id = #{ticketId}
           AND available_stock >= #{quantity}

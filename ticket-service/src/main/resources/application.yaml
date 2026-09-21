@@ -2,6 +2,28 @@ server:
   port: 8082
 
 spring:
+  flyway:
+    # Enables Flyway migration when the application starts.
+    enabled: true
+
+    # Loads versioned migration scripts from src/main/resources/db/migration.
+    locations: classpath:db/migration
+
+    # Validates applied migration versions and checksums before running new migrations.
+    validate-on-migrate: true
+
+    # Prevents Flyway clean from deleting all objects in the configured schema.
+    clean-disabled: true
+
+    # Allows Flyway to adopt the existing non-empty database.
+    baseline-on-migrate: true
+
+    # Baselines the existing database at version 0 so the V1 migration still runs.
+    baseline-version: "0"
+
+    # Stores Ticket Service migration history separately in the shared database.
+    table: flyway_ticket_schema_history
+
   application:
     name: tikcet-service
 
@@ -15,11 +37,6 @@ spring:
     username: root
     password: root
     driver-class-name: com.mysql.cj.jdbc.Driver
-
-  sql:
-    init:
-      mode: always
-      schema-locations: classpath:schema.sql
 
 mybatis:
   mapper-locations: classpath:mapper/*.xml

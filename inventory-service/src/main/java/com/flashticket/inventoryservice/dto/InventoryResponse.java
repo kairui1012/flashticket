@@ -11,6 +11,7 @@ public class InventoryResponse {
     private String ticketId;
     private Integer totalStock;
     private Integer availableStock;
+    private Integer reservedStock;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 
