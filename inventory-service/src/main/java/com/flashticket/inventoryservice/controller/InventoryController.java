@@ -36,22 +36,31 @@ public class InventoryController {
     }
 
     // Updates the available stock amount for one ticket.
-    @PutMapping("/update/{id}")
-    public ResponseEntity<InventoryResponse> updateAvailableStock(@PathVariable String ticketId, Integer availableStock){
+    @PutMapping("/update/{ticketId}")
+    public ResponseEntity<InventoryResponse> updateAvailableStock(
+            @PathVariable String ticketId,
+            @RequestParam Integer availableStock
+    ) {
         return ResponseEntity.ok(inventoryService.updateAvailableStock(ticketId,availableStock)
         );
     }
 
     // Increases available stock, for example after stock is released.
-    @PutMapping("/{id}/increase")
-    public ResponseEntity<InventoryResponse> increaseAvailableStock(@PathVariable String ticketId, Integer quantity){
+    @PutMapping("/{ticketId}/increase")
+    public ResponseEntity<InventoryResponse> increaseAvailableStock(
+            @PathVariable String ticketId,
+            @RequestParam Integer quantity
+    ) {
         return ResponseEntity.ok(inventoryService.increaseAvailableStock(ticketId,quantity)
         );
     }
 
     // Decreases available stock, for example after stock is reserved.
-    @PutMapping("/{id}/decrease")
-    public ResponseEntity<InventoryResponse> decreaseAvailableStock(@PathVariable String ticketId, Integer quantity){
+    @PutMapping("/{ticketId}/decrease")
+    public ResponseEntity<InventoryResponse> decreaseAvailableStock(
+            @PathVariable String ticketId,
+            @RequestParam Integer quantity
+    ) {
         return ResponseEntity.ok(inventoryService.decreaseAvailableStock(ticketId,quantity)
         );
     }

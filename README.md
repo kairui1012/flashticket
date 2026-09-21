@@ -1,8 +1,8 @@
 # FlashTicket
 
-FlashTicket is a work-in-progress microservices ticketing platform for concerts, events, and live performances. The current backend provides authentication, JWT authorization, ticket management, Redis caching, gateway routing, and per-user rate limiting.
+FlashTicket is a work-in-progress microservices ticketing platform for concerts, events, and live performances. The current backend provides authentication, JWT authorization, ticket management, inventory management, Redis-backed atomic stock reservation, gateway routing, and per-user rate limiting.
 
-FlashTicket 是一个正在开发中的微服务票务平台，面向演唱会、活动及其他现场演出。目前后端已经实现身份认证、JWT 权限控制、票种管理、Redis 缓存、网关路由和按用户限流。
+FlashTicket 是一个正在开发中的微服务票务平台，面向演唱会、活动及其他现场演出。目前后端已经实现身份认证、JWT 权限控制、票种管理、库存管理、基于 Redis 的原子库存预留、网关路由和按用户限流。
 
 ## Current status / 当前状态
 
@@ -11,18 +11,24 @@ Implemented / 已实现：
 - `api-gateway` on port `8080`
 - `auth-service` on port `8081`
 - `ticket-service` on port `8082`
+- `inventory-service` on port `8083`
 - Registration and login with BCrypt password hashing
 - RSA-signed JWT access tokens with `USER` and `ADMIN` roles
 - JWT verification and role-based access control at the gateway
 - Ticket creation, lookup, partial update, and cancellation
 - Redis caching for individual tickets and event ticket lists
+- Inventory creation, lookup, and manual stock adjustment
+- Inventory caching and short-lived negative caching in Redis
+- Atomic stock reservation with Redis Lua scripts and five-minute per-user reservation keys
+- `inventory.reserved` Kafka events with idempotent MySQL synchronization
+- Flyway-managed inventory and processed-event tables
 - Redis-backed per-user gateway rate limiting
 - MySQL persistence through MyBatis
 - Local MySQL, Redis, Kafka, and ZooKeeper infrastructure through Docker Compose
 
-The `inventory-service` directory is currently an early skeleton. Inventory reservation, orders, payments, electronic ticket delivery, and notifications are not yet implemented.
+Inventory release and Kafka-failure compensation are currently being completed. The release event is produced, but its MySQL consumer is not yet implemented, so the release workflow is not yet a complete end-to-end flow. Orders, payments, electronic ticket delivery, and notifications are also not yet implemented.
 
-`inventory-service` 目前仍是初始骨架。库存锁定、订单、支付、电子票交付和通知服务尚未完成。
+库存释放及 Kafka 发送失败后的补偿流程目前仍在完善中。系统已经会发布库存释放事件，但尚未实现对应的 MySQL 消费者，因此释放流程还没有形成完整闭环。订单、支付、电子票交付和通知服务也尚未实现。
 
 For the proposed architecture and development roadmap, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
@@ -36,7 +42,8 @@ For the proposed architecture and development roadmap, see [DEVELOPMENT.md](DEVE
 | Security | Spring Security, OAuth2 Resource Server, JWT |
 | Persistence | MySQL 8, MyBatis |
 | Cache and rate limiting | Redis |
-| Messaging infrastructure | Kafka, ZooKeeper |
+| Messaging | Kafka, ZooKeeper |
+| Database migrations | Flyway |
 | Build tool | Maven Wrapper |
 | Local infrastructure | Docker Compose |
 
@@ -47,7 +54,7 @@ FlashTicket/
 ├── api-gateway/       # Routing, JWT verification, authorization and rate limiting
 ├── auth-service/      # Registration, login and JWT generation
 ├── ticket-service/    # Ticket CRUD, validation and Redis caching
-├── inventory-service/ # Early inventory-service skeleton
+├── inventory-service/ # Inventory, Redis Lua reservation and Kafka synchronization
 ├── keys/              # Local RSA keys; never commit the private key
 ├── docker-compose.yml # MySQL, Redis, Kafka and ZooKeeper
 └── DEVELOPMENT.md     # Proposed architecture and roadmap
@@ -60,6 +67,7 @@ FlashTicket/
 | API Gateway | `8080` |
 | Auth Service | `8081` |
 | Ticket Service | `8082` |
+| Inventory Service | `8083` |
 | MySQL | `3307` |
 | Redis | `6379` |
 | Kafka | `9092` |
@@ -128,7 +136,22 @@ cd ticket-service
 ./mvnw spring-boot:run
 ```
 
-### 5. Start API Gateway / 启动 API Gateway
+### 5. Start Inventory Service / 启动库存服务
+
+Open another terminal from the repository root. Ticket Service must already be available because Inventory Service validates ticket existence and sale times through OpenFeign.
+
+打开另一个终端。Inventory Service 会通过 OpenFeign 验证票种是否存在及售卖时间，因此需要先启动 Ticket Service。
+
+```bash
+cd inventory-service
+./mvnw spring-boot:run
+```
+
+Flyway automatically creates and validates the inventory tables when this service starts.
+
+Inventory Service 启动时，Flyway 会自动创建并校验库存相关数据表。
+
+### 6. Start API Gateway / 启动 API Gateway
 
 Open another terminal from the repository root:
 
@@ -137,9 +160,9 @@ cd api-gateway
 ./mvnw spring-boot:run
 ```
 
-Clients should normally access Auth and Ticket APIs through `http://localhost:8080`.
+Clients should normally access Auth, Ticket, and Inventory APIs through `http://localhost:8080`.
 
-客户端正常情况下应通过 `http://localhost:8080` 访问 Auth 和 Ticket API。
+客户端正常情况下应通过 `http://localhost:8080` 访问 Auth、Ticket 和 Inventory API。
 
 ## Authentication API / 认证接口
 
@@ -238,6 +261,57 @@ curl -X PATCH http://localhost:8080/api/v1/tickets/<TICKET_ID>/status/cancel \
   -H 'Authorization: Bearer <JWT>'
 ```
 
+## Inventory API / 库存接口
+
+Inventory endpoints are routed through the Gateway. `GET` requests allow `USER` and `ADMIN`; write operations currently require an `ADMIN` token.
+
+库存接口已经接入 Gateway。`GET` 请求允许 `USER` 和 `ADMIN` 访问，写操作目前需要 `ADMIN` Token。
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `POST` | `/api/v1/inventory/insert` | Create inventory for an existing ticket / 为现有票种创建库存 |
+| `GET` | `/api/v1/inventory/{ticketId}` | Get inventory by ticket ID / 按票种 ID 查询库存 |
+| `PUT` | `/api/v1/inventory/update/{ticketId}` | Replace available stock / 修改可用库存 |
+| `PUT` | `/api/v1/inventory/{ticketId}/increase` | Increase total and available stock / 增加总库存及可用库存 |
+| `PUT` | `/api/v1/inventory/{ticketId}/decrease` | Decrease total and available stock / 减少总库存及可用库存 |
+| `POST` | `/api/v1/inventory/reserve` | Atomically reserve stock / 原子预留库存 |
+| `POST` | `/api/v1/inventory/release` | Release a user's reservation; workflow still in progress / 释放用户预留库存，流程仍在完善 |
+
+### Create and query inventory / 创建及查询库存
+
+The referenced ticket must already exist.
+
+对应的票种必须已经存在。
+
+```bash
+curl -X POST http://localhost:8080/api/v1/inventory/insert \
+  -H 'Authorization: Bearer <ADMIN_JWT>' \
+  -H 'Content-Type: application/json' \
+  -d '{"ticketId":"<TICKET_ID>","totalStock":100}'
+```
+
+```bash
+curl http://localhost:8080/api/v1/inventory/<TICKET_ID> \
+  -H 'Authorization: Bearer <JWT>'
+```
+
+### Reserve stock / 预留库存
+
+The service validates the ticket sale window, atomically decrements `inventory:stock:{ticketId}`, and creates `inventory:reserved:{ticketId}:{userId}` with a five-minute TTL. A successful reservation publishes `inventory.reserved`; the idempotent consumer then synchronizes MySQL.
+
+服务会先验证票种售卖时间，再原子扣减 `inventory:stock:{ticketId}`，并创建有效期为五分钟的 `inventory:reserved:{ticketId}:{userId}`。预留成功后会发布 `inventory.reserved`，再由具备幂等处理的消费者同步 MySQL。
+
+```bash
+curl -X POST http://localhost:8080/api/v1/inventory/reserve \
+  -H 'Authorization: Bearer <ADMIN_JWT>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ticketId":"<TICKET_ID>",
+    "userId":"<USER_ID>",
+    "reservedStock":2
+  }'
+```
+
 ## Redis behavior / Redis 行为
 
 Ticket Service caches the following query results for 10 minutes:
@@ -248,6 +322,15 @@ Ticket Service caches the following query results for 10 minutes:
 Creating a ticket invalidates its event-list cache. Updating or cancelling a ticket refreshes its individual cache and invalidates the related event-list cache.
 
 创建票种时会清除对应活动列表缓存；更新或取消票种时会刷新单票缓存，并清除对应活动列表缓存。
+
+Inventory Service uses these keys:
+
+- `inventory:{ticketId}`: inventory-detail cache with a 10-minute TTL
+- `inventory:not-found:{ticketId}`: missing-inventory marker with a 30-second TTL
+- `inventory:stock:{ticketId}`: available-stock counter used by Lua scripts
+- `inventory:reserved:{ticketId}:{userId}`: per-user reservation with a five-minute TTL
+
+Inventory Service 使用以上 Redis Key 缓存库存详情、防止缓存穿透，并通过 Lua 脚本原子处理可用库存和用户预留记录。
 
 API Gateway also uses Redis to limit each authenticated user to a replenish rate of 5 Ticket requests per second with a burst capacity of 10.
 
@@ -400,7 +483,7 @@ curl -sS -o /dev/null -w 'event_cache_hit=%{time_total}s\n' "$EVENT_URL"
 
 ## Manual smoke check / 手动快速检查
 
-After all three Java services are running:
+After all four Java services are running:
 
 1. Register a new account through the Gateway and confirm `201 Created`.
 2. Log in with the same credentials and confirm `200 OK` with a non-empty `accessToken`.
@@ -408,24 +491,27 @@ After all three Java services are running:
 4. Call `POST /api/v1/tickets` with a `USER` token and confirm `403 Forbidden`.
 5. Promote the account to `ADMIN`, log in again, and create a ticket through the Gateway.
 6. Query the created ticket twice and inspect Redis to confirm that a cache key with a TTL is present.
+7. Create inventory for the ticket and confirm that `inventory:stock:{ticketId}` contains the initial stock.
+8. Reserve stock and confirm that the available-stock counter decreases atomically and the per-user reservation key has a TTL.
+9. Confirm that the Inventory Service consumes `inventory.reserved` and updates MySQL only once for the event ID.
 
 ## Roadmap / 开发计划
 
-- Complete inventory reservation and concurrency control
+- Complete and verify the inventory release/compensation workflow
 - Add event and venue management
 - Add order and payment workflows
 - Generate and validate electronic tickets
-- Publish and consume domain events through Kafka
+- Expand Kafka domain events across order, payment, ticket delivery, and notification workflows
 - Add notification delivery
-- Add database migrations, integration tests, tracing, and production-ready secrets
+- Add integration tests, tracing, and production-ready secrets
 
-- 完成库存锁定和并发控制
+- 完成并验证库存释放及补偿闭环
 - 增加活动与场馆管理
 - 增加订单和支付流程
 - 生成和验证电子票
-- 通过 Kafka 发布及消费领域事件
+- 将 Kafka 领域事件扩展至订单、支付、电子票交付及通知流程
 - 增加通知服务
-- 增加数据库迁移、集成测试、链路追踪和生产级密钥管理
+- 增加集成测试、链路追踪和生产级密钥管理
 
 ## Security note / 安全说明
 
