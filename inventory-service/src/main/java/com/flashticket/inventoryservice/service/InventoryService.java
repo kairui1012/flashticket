@@ -349,7 +349,7 @@ public class InventoryService {
      * KEYS[1] = available-stock key
      * KEYS[2] = stock reserved by this user for this ticket
      * ARGV[1] = quantity requested by the user
-     */
+    */
     public InventoryResponse reserveStock(ReserveStockRequest request) {
         // STEP 1 -> Confirm that the ticket is currently eligible for reservation.
         // This check happens before Lua so an invalid sale never changes Redis stock.
@@ -373,8 +373,9 @@ public class InventoryService {
                 String.valueOf(request.getReservedStock())
         );
 
-        // STEP 4 -> Continue only when Lua returns 1, which means the reservation succeeded.
-        if (!Objects.equals(result, 1L)) {
+        // STEP 4 -> A non-negative result is the remaining stock after a successful
+        // reservation. Negative values are failure codes returned by the Lua script.
+        if (result == null || result < 0) {
             throw new ResponseStatusException(
                     HttpStatus.CONFLICT,
                     "Unable to reserve the requested stock"
@@ -443,27 +444,15 @@ public class InventoryService {
         // the Lua script has already changed the dedicated Redis stock counter.
         InventoryResponse response = findByTicketId(request.getTicketId());
 
-        // STEP 8 -> Read the authoritative remaining stock from the Redis counter that
-        // was atomically decremented by the reservation Lua script.
-        String availableStock = stringRedisTemplate.opsForValue().get(stockKey);
-
-        // STEP 9 -> Treat a missing stock counter as an inconsistent Redis state because
-        // the reservation Lua script and Kafka publishing have already succeeded.
-        if (availableStock == null) {
-            throw new ResponseStatusException(
-                    HttpStatus.INTERNAL_SERVER_ERROR,
-                    "Stock cache is missing after reservation"
-            );
-        }
-
-        // STEP 10 -> Replace the possibly stale response values with the latest Redis data.
+        // STEP 8 -> Replace the possibly stale response values with the remaining stock
+        // returned atomically by the Lua script, avoiding a second Redis read.
         // In the current inventory model, reserved stock is derived as total minus available.
-        int latestAvailableStock = Integer.parseInt(availableStock);
+        int latestAvailableStock = Math.toIntExact(result);
         response.setAvailableStock(latestAvailableStock);
         response.setReservedStock(response.getTotalStock() - latestAvailableStock);
         response.setUpdatedAt(LocalDateTime.now());
 
-        // STEP 11 -> Refresh the inventory-detail cache so later read requests see the
+        // STEP 9 -> Refresh the inventory-detail cache so later read requests see the
         // latest reservation result without querying MySQL immediately.
         redisTemplate.opsForValue().set(
                 inventoryDetailKey(request.getTicketId()),
@@ -471,7 +460,7 @@ public class InventoryService {
                 CACHE_TTL
         );
 
-        // STEP 12 -> Return after submitting the Kafka send; its acknowledgement may arrive later.
+        // STEP 10 -> Return after submitting the Kafka send; its acknowledgement may arrive later.
         return response;
     }
 
@@ -483,43 +472,35 @@ public class InventoryService {
                 request.getUserId()
         );
 
-        // STEP 2 -> Read the trusted reservation quantity stored by the reservation Lua script.
-        String reservedQuantity = stringRedisTemplate.opsForValue().get(reservationKey);
-
-        // STEP 3 -> Stop when this user no longer has an active reservation for the ticket.
-        if (reservedQuantity == null) {
-            throw new ResponseStatusException(
-                    HttpStatus.CONFLICT,
-                    "No active reservation was found for this user and ticket"
-            );
-        }
-
-        // STEP 4 -> Create a unique release event for idempotent MySQL synchronization.
+        // STEP 2 -> Create a unique release event for idempotent MySQL synchronization.
+        // The Lua script atomically verifies this quantity against the stored reservation
+        // before the event is published.
         InventoryReleaseEvent event = new InventoryReleaseEvent(
                 UUID.randomUUID().toString(),
                 request.getTicketId(),
                 request.getUserId(),
-                Integer.valueOf(reservedQuantity),
+                request.getReservedStock(),
                 LocalDateTime.now()
         );
 
-        // STEP 5 -> Atomically return the reserved quantity to Redis stock and delete
+        // STEP 3 -> Atomically validate and return the reserved quantity to Redis stock, then delete
         // the user's reservation key. KEYS[1] is stock and KEYS[2] is the reservation.
         Long result = stringRedisTemplate.execute(
                 redisConfig.releaseScript(),
                 List.of(stockKey, reservationKey),
-                reservedQuantity
+                String.valueOf(request.getReservedStock())
         );
 
-        // STEP 6 -> Continue only when Lua returns 1, which means the release succeeded.
-        if (!Objects.equals(result, 1L)) {
+        // STEP 4 -> A non-negative result is the remaining stock after a successful release.
+        // Negative values are failure codes returned by the Lua script.
+        if (result == null || result < 0) {
             throw new ResponseStatusException(
                     HttpStatus.CONFLICT,
                     "Unable to release the reserved stock"
             );
         }
 
-        // STEP 7 -> Publish the release event and wait for Kafka acknowledgement.
+        // STEP 5 -> Publish the release event and wait for Kafka acknowledgement.
         // If publishing fails, reserve the same quantity again to compensate Redis.
         try {
             kafkaTemplate.send(
@@ -531,10 +512,10 @@ public class InventoryService {
             Long compensationResult = stringRedisTemplate.execute(
                     redisConfig.reserveStockScript(),
                     List.of(stockKey, reservationKey),
-                    reservedQuantity
+                    String.valueOf(request.getReservedStock())
             );
 
-            if (!Objects.equals(compensationResult, 1L)) {
+            if (compensationResult == null || compensationResult < 0) {
                 throw new ResponseStatusException(
                         HttpStatus.INTERNAL_SERVER_ERROR,
                         "Kafka publishing and Redis release compensation both failed"
@@ -547,31 +528,24 @@ public class InventoryService {
             );
         }
 
-        // STEP 8 -> Load the base inventory details and read the latest Redis stock value.
+        // STEP 6 -> Load the base inventory details. The release Lua result already contains
+        // the latest stock value, so no additional Redis stock read is needed.
         InventoryResponse response = findByTicketId(request.getTicketId());
-        String availableStock = stringRedisTemplate.opsForValue().get(stockKey);
 
-        if (availableStock == null) {
-            throw new ResponseStatusException(
-                    HttpStatus.INTERNAL_SERVER_ERROR,
-                    "Stock cache is missing after release"
-            );
-        }
-
-        // STEP 9 -> Update the response with the latest available and reserved quantities.
-        int latestAvailableStock = Integer.parseInt(availableStock);
+        // STEP 7 -> Update the response with the latest available and reserved quantities.
+        int latestAvailableStock = Math.toIntExact(result);
         response.setAvailableStock(latestAvailableStock);
         response.setReservedStock(response.getTotalStock() - latestAvailableStock);
         response.setUpdatedAt(LocalDateTime.now());
 
-        // STEP 10 -> Refresh the inventory-detail cache with the released stock result.
+        // STEP 8 -> Refresh the inventory-detail cache with the released stock result.
         redisTemplate.opsForValue().set(
                 inventoryDetailKey(request.getTicketId()),
                 response,
                 CACHE_TTL
         );
 
-        // STEP 11 -> Return the latest inventory response to the client.
+        // STEP 9 -> Return the latest inventory response to the client.
         return response;
     }
 

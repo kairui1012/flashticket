@@ -4,14 +4,14 @@
 -- 3. Check whether availableStock is greater than or equal to quantity.
 -- 4. Decrease the available stock using DECRBY.
 -- 5. Store the user's reservation with a five-minute expiration.
--- 6. Return the corresponding status code.
+-- 6. Return the remaining stock or the corresponding failure code.
 
--- Return codes:
--- 1 = Reservation succeeded.
--- 0 = Insufficient stock.
+-- Return values:
+-- 0 or greater = Reservation succeeded; the value is the remaining stock.
 -- -1 = The stock key does not exist.
 -- -2 = The user has already reserved stock.
 -- -3 = The requested quantity is invalid.
+-- -4 = Insufficient stock.
 
 local stockKey = KEYS[1]
 local reservationKey = KEYS[2]
@@ -37,10 +37,10 @@ end
 availableStock = tonumber(availableStock)
 
 if availableStock < quantity then
-    return 0
+    return -4
 end
 
-redis.call("DECRBY", stockKey, quantity)
+local remainingStock = redis.call("DECRBY", stockKey, quantity)
 
 redis.call("SET", reservationKey, quantity, "EX", reservationTtlSeconds)
-return 1
+return remainingStock

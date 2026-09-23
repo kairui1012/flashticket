@@ -6,12 +6,12 @@
 -- 5. Return the reserved quantity to available stock.
 -- 6. Delete the user's reservation key.
 
--- Return codes:
--- 1 = Release succeeded.
--- 0 = The reservation key does not exist.
+-- Return values:
+-- 0 or greater = Release succeeded; the value is the remaining stock.
 -- -1 = The stock key does not exist.
 -- -2 = The reservation quantity does not match.
 -- -3 = The requested quantity is invalid.
+-- -4 = The reservation key does not exist.
 
 local stockKey = KEYS[1]
 local reservationKey = KEYS[2]
@@ -28,7 +28,7 @@ end
 local reservedQuantity = redis.call("GET", reservationKey)
 
 if not reservedQuantity then
-    return 0
+    return -4
 end
 
 reservedQuantity = tonumber(reservedQuantity)
@@ -37,7 +37,7 @@ if reservedQuantity ~= quantity then
     return -2
 end
 
-redis.call("INCRBY", stockKey, quantity)
+local remainingStock = redis.call("INCRBY", stockKey, quantity)
 redis.call("DEL", reservationKey)
 
-return 1
+return remainingStock
