@@ -21,7 +21,7 @@ spring:
     # Baselines the existing database at version 0 so the V1 migration still runs.
     baseline-version: "0"
 
-    # Stores Ticket Service migration history separately in the shared database.
+    # Stores the Ticket Service migration history in its own database.
     table: flyway_ticket_schema_history
 
   application:
@@ -33,9 +33,9 @@ spring:
       port: 6379
 
   datasource:
-    url: jdbc:mysql://localhost:3307/flashticket_auth?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Kuala_Lumpur
-    username: root
-    password: root
+    url: ${TICKET_DB_URL:jdbc:mysql://localhost:3307/flashticket_ticket?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Kuala_Lumpur}
+    username: ${TICKET_DB_USERNAME:root}
+    password: ${TICKET_DB_PASSWORD:root}
     driver-class-name: com.mysql.cj.jdbc.Driver
 
 mybatis:

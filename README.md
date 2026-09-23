@@ -20,15 +20,16 @@ Implemented / 已实现：
 - Inventory creation, lookup, and manual stock adjustment
 - Inventory caching and short-lived negative caching in Redis
 - Atomic stock reservation with Redis Lua scripts and five-minute per-user reservation keys
-- `inventory.reserved` Kafka events with idempotent MySQL synchronization
+- `inventory.reserved` and `inventory.release` Kafka events with idempotent MySQL synchronization
+- Redis compensation when reservation or release event publishing fails
 - Flyway-managed inventory and processed-event tables
 - Redis-backed per-user gateway rate limiting
 - MySQL persistence through MyBatis
 - Local MySQL, Redis, Kafka, and ZooKeeper infrastructure through Docker Compose
 
-Inventory release and Kafka-failure compensation are currently being completed. The release event is produced, but its MySQL consumer is not yet implemented, so the release workflow is not yet a complete end-to-end flow. Orders, payments, electronic ticket delivery, and notifications are also not yet implemented.
+Reservation and explicit release now work end to end across Redis, Kafka, and MySQL. Automatic release after a five-minute reservation timeout is not yet enabled, so an expired reservation is not currently returned to available stock automatically. Orders, payments, electronic ticket delivery, and notifications are also not yet implemented.
 
-库存释放及 Kafka 发送失败后的补偿流程目前仍在完善中。系统已经会发布库存释放事件，但尚未实现对应的 MySQL 消费者，因此释放流程还没有形成完整闭环。订单、支付、电子票交付和通知服务也尚未实现。
+库存预留及主动释放现在已经能够贯通 Redis、Kafka 和 MySQL。五分钟预留超时后的自动释放尚未启用，因此预留记录过期后，目前不会自动将库存归还至可用库存。订单、支付、电子票交付和通知服务也尚未实现。
 
 For the proposed architecture and development roadmap, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
@@ -93,18 +94,20 @@ docker compose up -d
 docker compose ps
 ```
 
-Ensure the development database exists. This command is also useful after manually dropping the database while retaining the Docker volume:
+On a new Docker volume, the initialization script creates one database for each current service. If an older MySQL volume already exists, create the databases manually because `/docker-entrypoint-initdb.d` only runs when MySQL initializes an empty data directory:
 
-如果曾经在保留 Docker Volume 的情况下手动删除数据库，请执行以下命令重新创建开发数据库：
+新的 Docker Volume 会通过初始化脚本为每个现有服务创建独立数据库。如果继续使用旧的 MySQL Volume，需要手动创建这些数据库，因为 `/docker-entrypoint-initdb.d` 只会在空数据目录首次初始化时执行：
 
 ```bash
 docker exec flashticket-mysql mysql -uroot -proot -e \
-  "CREATE DATABASE IF NOT EXISTS flashticket_auth CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  "CREATE DATABASE IF NOT EXISTS flashticket_auths CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+   CREATE DATABASE IF NOT EXISTS flashticket_ticket CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+   CREATE DATABASE IF NOT EXISTS flashticket_inventory CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 ```
 
-The Auth and Ticket services automatically create their tables from their respective `schema.sql` files when they start.
+Auth, Ticket, and Inventory services apply their own Flyway migrations when they start.
 
-Auth 和 Ticket 服务启动时会通过各自的 `schema.sql` 自动创建数据表。
+Auth、Ticket 和 Inventory 服务启动时会分别执行各自的 Flyway 数据库迁移。
 
 ### 2. Prepare RSA keys / 准备 RSA 密钥
 
@@ -275,7 +278,7 @@ Inventory endpoints are routed through the Gateway. `GET` requests allow `USER` 
 | `PUT` | `/api/v1/inventory/{ticketId}/increase` | Increase total and available stock / 增加总库存及可用库存 |
 | `PUT` | `/api/v1/inventory/{ticketId}/decrease` | Decrease total and available stock / 减少总库存及可用库存 |
 | `POST` | `/api/v1/inventory/reserve` | Atomically reserve stock / 原子预留库存 |
-| `POST` | `/api/v1/inventory/release` | Release a user's reservation; workflow still in progress / 释放用户预留库存，流程仍在完善 |
+| `POST` | `/api/v1/inventory/release` | Release a user's reservation / 释放用户预留库存 |
 
 ### Create and query inventory / 创建及查询库存
 
@@ -312,6 +315,23 @@ curl -X POST http://localhost:8080/api/v1/inventory/reserve \
   }'
 ```
 
+### Release stock / 释放库存
+
+The release flow reads the trusted quantity from the user's Redis reservation, atomically returns it to available stock, publishes `inventory.release`, and idempotently synchronizes MySQL.
+
+释放流程会读取 Redis 中保存的可信预留数量，原子归还可用库存，发布 `inventory.release`，并以幂等方式同步 MySQL。
+
+```bash
+curl -X POST http://localhost:8080/api/v1/inventory/release \
+  -H 'Authorization: Bearer <ADMIN_JWT>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ticketId":"<TICKET_ID>",
+    "userId":"<USER_ID>",
+    "reservedStock":2
+  }'
+```
+
 ## Redis behavior / Redis 行为
 
 Ticket Service caches the following query results for 10 minutes:
@@ -331,6 +351,31 @@ Inventory Service uses these keys:
 - `inventory:reserved:{ticketId}:{userId}`: per-user reservation with a five-minute TTL
 
 Inventory Service 使用以上 Redis Key 缓存库存详情、防止缓存穿透，并通过 Lua 脚本原子处理可用库存和用户预留记录。
+
+## Inventory runtime verification / 库存真实运行验证
+
+The following results were measured locally on September 23, 2026 using real HTTP requests against Inventory Service on port `8083`, with MySQL, Redis, Kafka, ZooKeeper, and Ticket Service running. These are runtime checks rather than unit-test claims.
+
+以下结果于 2026 年 9 月 23 日在本机实测：启动 MySQL、Redis、Kafka、ZooKeeper 和 Ticket Service 后，直接通过 `8083` 对 Inventory Service 发送真实 HTTP 请求。这些结果属于运行验证，不是单元测试结论。
+
+| Check | Observed result |
+| --- | --- |
+| Build and startup | Maven compile passed; Inventory Service started on `8083`; Flyway schema version was `2` |
+| Create inventory | `POST /api/v1/inventory/insert` returned `201 Created` with stock `5` |
+| Cached lookup | `GET /api/v1/inventory/{ticketId}` returned `200 OK`; JSON cache deserialization succeeded |
+| Reserve stock | Reserving `2` returned `200 OK`; Redis available stock changed from `5` to `3` |
+| Reservation TTL | `inventory:reserved:{ticketId}:{userId}` reported `300` seconds immediately after reservation |
+| Duplicate reservation | A second reservation by the same user returned `409 Conflict` |
+| Oversell protection | Requesting `4` while only `3` remained returned `409 Conflict` |
+| Reservation event | MySQL became `total=5, available=3, reserved=2`; one `INVENTORY_RESERVED` event was recorded |
+| Release stock | Release returned `200 OK`; Redis and MySQL both returned to `available=5, reserved=0` |
+| Release event | One `INVENTORY_RELEASED` event was recorded; a second release returned `409 Conflict` |
+| Duplicate inventory | Creating inventory again for the same ticket returned `409 Conflict` |
+| Negative cache | A missing inventory returned `404 Not Found` and created a 30-second negative-cache marker |
+
+The temporary ticket, inventory row, processed-event rows, and Redis keys used by this verification were removed afterward. The Inventory Service process started for the check was also stopped cleanly.
+
+本次验证使用的临时票种、库存记录、已处理事件和 Redis Key 均已清理；测试期间启动的 Inventory Service 也已正常停止。
 
 API Gateway also uses Redis to limit each authenticated user to a replenish rate of 5 Ticket requests per second with a burst capacity of 10.
 
@@ -494,10 +539,12 @@ After all four Java services are running:
 7. Create inventory for the ticket and confirm that `inventory:stock:{ticketId}` contains the initial stock.
 8. Reserve stock and confirm that the available-stock counter decreases atomically and the per-user reservation key has a TTL.
 9. Confirm that the Inventory Service consumes `inventory.reserved` and updates MySQL only once for the event ID.
+10. Release the reservation and confirm that Redis and MySQL both return to the original available stock.
+11. Confirm that `inventory.release` is processed once and that a repeated release returns `409 Conflict`.
 
 ## Roadmap / 开发计划
 
-- Complete and verify the inventory release/compensation workflow
+- Implement automatic stock release when a five-minute reservation expires
 - Add event and venue management
 - Add order and payment workflows
 - Generate and validate electronic tickets
@@ -505,7 +552,7 @@ After all four Java services are running:
 - Add notification delivery
 - Add integration tests, tracing, and production-ready secrets
 
-- 完成并验证库存释放及补偿闭环
+- 实现五分钟预留过期后的自动库存释放
 - 增加活动与场馆管理
 - 增加订单和支付流程
 - 生成和验证电子票

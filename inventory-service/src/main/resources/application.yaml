@@ -21,14 +21,14 @@ spring:
     # Uses version 0 as the baseline so V1 and later migrations still run.
     baseline-version: "0"
 
-    # Keeps Inventory migration records separate while multiple services share this database.
+    # Stores the Inventory Service migration history in its own database.
     table: flyway_inventory_schema_history
 
   application:
     name: inventory-service
 
   datasource:
-    url: ${INVENTORY_DB_URL:jdbc:mysql://localhost:3307/flashticket_auth?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Kuala_Lumpur}
+    url: ${INVENTORY_DB_URL:jdbc:mysql://localhost:3307/flashticket_inventory?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Kuala_Lumpur}
     username: ${INVENTORY_DB_USERNAME:root}
     password: ${INVENTORY_DB_PASSWORD:root}
     driver-class-name: com.mysql.cj.jdbc.Driver
@@ -80,7 +80,3 @@ management:
         include:
           - health
           - info
-
-logging:
-  level:
-    com.flashticket.inventoryservice.mapper: DEBUG

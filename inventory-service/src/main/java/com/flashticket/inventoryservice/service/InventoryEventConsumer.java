@@ -2,6 +2,7 @@ package com.flashticket.inventoryservice.service;
 
 import com.flashticket.inventoryservice.entity.EventType;
 import com.flashticket.inventoryservice.entity.ProcessedEvent;
+import com.flashticket.inventoryservice.event.InventoryReleaseEvent;
 import com.flashticket.inventoryservice.event.InventoryReservedEvent;
 import com.flashticket.inventoryservice.mapper.InventoryMapper;
 import com.flashticket.inventoryservice.mapper.ProcessedEventMapper;
@@ -22,6 +23,7 @@ public class InventoryEventConsumer {
     private final ProcessedEventMapper processedEventMapper;
 
     private static final String RESERVED_TOPIC = "inventory.reserved";
+    private static final String RELEASE_TOPIC = "inventory.release";
 
     @Transactional
     @KafkaListener(
@@ -88,6 +90,73 @@ public class InventoryEventConsumer {
         // STEP 8 -> Finish the listener so Spring can commit MySQL before Kafka advances the offset.
         log.info(
                 "Inventory reservation applied within the transaction: eventId={}",
+                event.getEventId()
+        );
+    }
+
+    @Transactional
+    @KafkaListener(
+            topics = RELEASE_TOPIC,
+            groupId = "inventory-service"
+    )
+    public void handleInventoryReleased(InventoryReleaseEvent event) {
+
+        // STEP 1 -> Validate the release event before using it for idempotency or stock updates.
+        if (event == null
+                || event.getEventId() == null
+                || event.getEventId().isBlank()
+                || event.getTicketId() == null
+                || event.getTicketId().isBlank()
+                || event.getQuantity() == null
+                || event.getQuantity() <= 0) {
+            throw new IllegalArgumentException("Invalid inventory release event");
+        }
+
+        // STEP 2 -> Build the processed-event record using the release event's stable ID.
+        ProcessedEvent processedEvent = new ProcessedEvent(
+                event.getEventId(),
+                EventType.INVENTORY_RELEASED,
+                LocalDateTime.now()
+        );
+
+        // STEP 3 -> Insert the event ID only if this release has not been processed before.
+        // The event_id primary key prevents concurrent Kafka redelivery from releasing stock twice.
+        int inserted = processedEventMapper.insertIfAbsent(processedEvent);
+
+        // STEP 4 -> Ignore a redelivered release event when its event ID already exists.
+        if (inserted == 0) {
+            log.info(
+                    "Skipping duplicate inventory released event: eventId={}",
+                    event.getEventId()
+            );
+            return;
+        }
+
+        // STEP 5 -> Log the new release event before applying its business change.
+        log.info(
+                "Processing inventory released event: eventId={}, ticketId={}, quantity={}",
+                event.getEventId(),
+                event.getTicketId(),
+                event.getQuantity()
+        );
+
+        // STEP 6 -> Conditionally move stock from reserved back to available in MySQL.
+        int updatedRows = inventoryMapper.releaseStock(
+                event.getTicketId(),
+                event.getQuantity()
+        );
+
+        // STEP 7 -> Throw on failure so both the stock update and processed-event insert roll back.
+        // Kafka can then retry the record instead of acknowledging an incomplete release.
+        if (updatedRows != 1) {
+            throw new IllegalStateException(
+                    "Failed to release inventory in MySQL for event: " + event.getEventId()
+            );
+        }
+
+        // STEP 8 -> Finish successfully so Spring can commit MySQL before Kafka advances the offset.
+        log.info(
+                "Inventory release applied within the transaction: eventId={}",
                 event.getEventId()
         );
     }

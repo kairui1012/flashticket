@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.flashticket.orderservice.mapper.OrderMapper">
+
+    <resultMap id="OrderResultMap"
+               type="com.flashticket.orderservice.entity.Order">
+        <id property="id" column="id"/>
+        <result property="userId" column="user_id"/>
+        <result property="ticketId" column="ticket_id"/>
+        <result property="quantity" column="quantity"/>
+        <result property="unitPrice" column="unit_price"/>
+        <result property="totalAmount" column="total_amount"/>
+        <result property="status" column="status"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="expiresAt" column="expires_at"/>
+        <result property="paidAt" column="paid_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <sql id="OrderColumns">
+        id,
+        user_id,
+        ticket_id,
+        quantity,
+        unit_price,
+        total_amount,
+        status,
+        created_at,
+        expires_at,
+        paid_at,
+        updated_at
+    </sql>
+
+    <insert id="insert">
+        INSERT INTO orders (
+            id,
+            user_id,
+            ticket_id,
+            quantity,
+            unit_price,
+            total_amount,
+            status,
+            created_at,
+            expires_at,
+            paid_at,
+            updated_at
+        ) VALUES (
+            #{id},
+            #{userId},
+            #{ticketId},
+            #{quantity},
+            #{unitPrice},
+            #{totalAmount},
+            #{status},
+            #{createdAt},
+            #{expiresAt},
+            #{paidAt},
+            #{updatedAt}
+        )
+    </insert>
+
+    <select id="findById" resultMap="OrderResultMap">
+        SELECT
+            <include refid="OrderColumns"/>
+        FROM orders
+        WHERE id = #{orderId}
+    </select>
+
+    <select id="findByUserId" resultMap="OrderResultMap">
+        SELECT
+            <include refid="OrderColumns"/>
+        FROM orders
+        WHERE user_id = #{userId}
+        ORDER BY created_at DESC
+    </select>
+
+    <update id="cancelPendingOrder">
+        UPDATE orders
+        SET status = 'CANCELLED',
+            updated_at = #{updatedAt}
+        WHERE id = #{orderId}
+          AND status = 'PENDING_PAYMENT'
+    </update>
+
+    <update id="markPendingOrderAsPaid">
+        UPDATE orders
+        SET status = 'PAID',
+            paid_at = #{paidAt},
+            updated_at = #{updatedAt}
+        WHERE id = #{orderId}
+          AND status = 'PENDING_PAYMENT'
+          AND expires_at &gt; #{paidAt}
+    </update>
+
+    <select id="findExpiredPendingOrders" resultMap="OrderResultMap">
+        SELECT
+            <include refid="OrderColumns"/>
+        FROM orders
+        WHERE status = 'PENDING_PAYMENT'
+          AND expires_at &lt;= #{now}
+        ORDER BY expires_at ASC
+        LIMIT #{limit}
+    </select>
+
+    <update id="expirePendingOrder">
+        UPDATE orders
+        SET status = 'EXPIRED',
+            updated_at = #{updatedAt}
+        WHERE id = #{orderId}
+          AND status = 'PENDING_PAYMENT'
+          AND expires_at &lt;= #{updatedAt}
+    </update>
+
+</mapper>

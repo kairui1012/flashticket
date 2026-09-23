@@ -22,6 +22,7 @@ import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
@@ -52,6 +53,7 @@ public class InventoryService {
     private final KafkaTemplate<String,Object> kafkaTemplate;
     private static final String RESERVED_TOPIC = "inventory.reserved";
     private static final String RELEASE_TOPIC = "inventory.release";
+    private static final String RESERVATION_TIMEOUTS_KEY = "inventory:reservation:timeouts";
 
     /**
      * Creates the initial inventory for a ticket.
@@ -379,6 +381,17 @@ public class InventoryService {
             );
         }
 
+        // TODO: Enable reservation timeout scheduling after Order Service is completed.
+//        long expireAt = System.currentTimeMillis() + Duration.ofMinutes(5).toMillis();
+//
+//        stringRedisTemplate.opsForZSet()
+//                .add(
+//                        RESERVATION_TIMEOUTS_KEY,
+//                        reservationKey,
+//                        expireAt
+//                );
+
+
         // STEP 5 -> Create a unique event for idempotent MySQL synchronization.
         // eventId allows the consumer to implement idempotency when Kafka redelivers a message.
         InventoryReservedEvent event = new InventoryReservedEvent(
@@ -388,6 +401,9 @@ public class InventoryService {
                 request.getReservedStock(),
                 LocalDateTime.now()
         );
+
+
+
 
         // STEP 6 -> Send the event and wait for Kafka acknowledgement.
         // If publishing fails, compensate Redis atomically before returning an error.
@@ -683,6 +699,5 @@ public class InventoryService {
 
         return response;
     }
-
 
 }

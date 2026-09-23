@@ -13,11 +13,12 @@ services:
     container_name: flashticket-mysql
     environment:
       MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: flashticket_auth
+      MYSQL_DATABASE: flashticket_auths
     ports:
       - "3307:3306"
     volumes:
       - flashticket-mysql-data:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
     networks:
       - flashticket-network
 

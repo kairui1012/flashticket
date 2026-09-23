@@ -21,16 +21,16 @@ spring:
     # Uses version 0 as the baseline so V1 still runs after an existing database is adopted.
     baseline-version: "0"
 
-    # Keeps Auth migration records separate while multiple services share this database.
+    # Stores the Auth Service migration history in its own database.
     table: flyway_auth_schema_history
 
   application:
     name: auth-service
 
   datasource:
-    url: jdbc:mysql://localhost:3307/flashticket_auth?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Kuala_Lumpur
-    username: root
-    password: root
+    url: ${AUTH_DB_URL:jdbc:mysql://localhost:3307/flashticket_auths?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Kuala_Lumpur}
+    username: ${AUTH_DB_USERNAME:root}
+    password: ${AUTH_DB_PASSWORD:root}
     driver-class-name: com.mysql.cj.jdbc.Driver
 
 mybatis:
