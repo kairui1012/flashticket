@@ -377,6 +377,62 @@ The temporary ticket, inventory row, processed-event rows, and Redis keys used b
 
 本次验证使用的临时票种、库存记录、已处理事件和 Redis Key 均已清理；测试期间启动的 Inventory Service 也已正常停止。
 
+### Inventory concurrency load test / 库存并发压测
+
+#### JMeter 10,000-user result / JMeter 万人压测结果
+
+The latest test used Apache JMeter 5.6.3 to send `10,000` reservation requests against `1,000` available tickets. The test data came from [`jmeter/users-10000.csv`](./jmeter/users-10000.csv). JMeter completed the run at `1,347.5 requests/second`, with an average response time of `169 ms`, P95 of `294 ms`, P99 of `359 ms`, and a maximum response time of `471 ms`.
+
+最新一次测试使用 Apache JMeter 5.6.3，让 `10,000` 个不同用户抢 `1,000` 张票，用户数据来自 [`jmeter/users-10000.csv`](./jmeter/users-10000.csv)。实测吞吐量为 `1,347.5 请求/秒`，平均响应时间 `169 ms`，P95 为 `294 ms`，P99 为 `359 ms`，最大响应时间为 `471 ms`。
+
+| Metric / 指标 | JMeter result / 实测结果 |
+| --- | ---: |
+| Total requests / 总请求数 | `10,000` |
+| Available tickets / 可售票数 | `1,000` |
+| Throughput / 吞吐量 | `1,347.5 requests/second` |
+| Average response / 平均响应 | `169 ms` |
+| Median response / 中位响应 | `158 ms` |
+| P90 | `271 ms` |
+| P95 | `294 ms` |
+| P99 | `359 ms` |
+| Minimum response / 最小响应 | `8 ms` |
+| Maximum response / 最大响应 | `471 ms` |
+| Standard deviation / 标准差 | `72.86 ms` |
+| Successful requests / 成功请求 | approximately `1,000` |
+| Rejected requests / 拒绝请求 | approximately `9,000` (`90.00%`) |
+
+The approximately `9,000` rejected requests are consistent with the expected stock-exhaustion conflicts after the first `1,000` reservations consumed all available tickets. In this flash-sale scenario, JMeter counts those expected non-2xx responses as errors. The Aggregate Report and Summary Report screenshots are retained below as test evidence.
+
+约 `9,000` 个失败请求与库存耗尽后的预期冲突一致：前 `1,000` 个请求成功预留全部库存，后续请求被拒绝。在该秒杀场景中，JMeter 会将这些预期的非 2xx 响应计入错误率。Aggregate Report 和 Summary Report 截图保留如下，作为测试证据。
+
+![JMeter Aggregate Report](./jmeter/image.png)
+
+![JMeter Summary Report](./jmeter/image_2.png)
+
+> The screenshots report aggregate HTTP errors but do not list individual response codes. Confirm expected `409 Conflict` responses in the JMeter result log when auditing a future run.
+>
+> 截图显示的是汇总 HTTP 错误率，不包含每条响应的具体状态码。后续审计压测时，应在 JMeter 结果日志中确认失败请求属于预期的 `409 Conflict`。
+
+On September 23, 2026, a real HTTP load test sent `1000` unique-user reservation requests for `100` tickets with client concurrency `200`. The run completed in `8` seconds: exactly `100` requests returned `200`, `900` returned `409`, and no other status was returned. Redis finished at available stock `0` with `100` reservation keys; MySQL finished at `total=100`, `available=0`, `reserved=100`; and exactly `100` reservation events were processed. No overselling or negative stock was observed.
+
+2026 年 9 月 23 日的真实 HTTP 压测使用 `1000` 个不同用户并发抢 `100` 张票，客户端并发数为 `200`。测试耗时 `8` 秒：恰好 `100` 个请求返回 `200`，`900` 个请求返回 `409`，没有其他 HTTP 状态。Redis 最终可用库存为 `0` 且有 `100` 个预留 Key；MySQL 最终为 `total=100`、`available=0`、`reserved=100`；成功处理的预留事件也正好为 `100`。未发现超卖或负库存。
+
+A second timed run used `1000` tickets, `10000` unique users, and client concurrency `500`. Exactly `1000` requests returned `200` and `9000` returned `409`; there were no curl errors, other HTTP statuses, negative stock, or overselling. Wall-clock duration was `97.568` seconds (`102.49 RPS`), with average latency `27 ms`, P95 `84.921 ms`, and P99 `149.477 ms`. These throughput figures include the overhead of spawning `10000` shell/curl processes, writing individual result files, and DEBUG logging, so they are not a server-capacity ceiling.
+
+第二次计时压测使用 `1000` 张票、`10000` 个不同用户及 `500` 客户端并发。恰好 `1000` 个请求返回 `200`，`9000` 个请求返回 `409`；没有 curl 错误、其他 HTTP 状态、负库存或超卖。总耗时为 `97.568` 秒（`102.49 RPS`），平均延迟 `27 ms`、P95 `84.921 ms`、P99 `149.477 ms`。吞吐量包含创建 `10000` 个 Shell/curl 进程、写入独立结果文件和 DEBUG 日志的开销，因此不能视为服务端容量上限。
+
+After reservation-event publishing was changed from blocking Kafka acknowledgement to an asynchronous callback, the same scenario was rerun. Correctness still passed (`1000` successes, `9000` conflicts, Redis and MySQL both consistent), but this single run measured `85.29 RPS`, average `30.915 ms`, P95 `86.686 ms`, and P99 `241.384 ms`. MySQL converged only `0.156` seconds after all HTTP requests completed. Because the shell-based client is process-spawn limited and all dependencies share one local machine, this one-run difference is not sufficient evidence that the asynchronous code itself caused a regression.
+
+库存事件从阻塞等待 Kafka 确认改为异步回调后，使用相同场景再次复测。正确性仍然通过（`1000` 个成功、`9000` 个冲突，Redis 与 MySQL 一致），但单次实测为 `85.29 RPS`、平均 `30.915 ms`、P95 `86.686 ms`、P99 `241.384 ms`；全部 HTTP 请求完成后，MySQL 仅需 `0.156` 秒便完成同步。由于 Shell 客户端受进程创建速度限制，并且全部依赖共享一台本机，不能仅凭这一轮差异断定异步代码本身造成性能回退。
+
+The Ticket status remained `DRAFT` after stock reached zero. Automatic `SOLD_OUT` transition is not implemented yet, and atomic Redis stock validation must still remain even after that feature is added.
+
+库存归零后 Ticket 状态仍为 `DRAFT`，说明自动转换为 `SOLD_OUT` 尚未实现。即使后续增加自动售罄功能，也仍需保留 Redis 原子库存校验。
+
+The complete reusable script, assertions, inspection commands, and cleanup steps are kept in [INVENTORY_LOAD_TEST.md](./INVENTORY_LOAD_TEST.md).
+
+完整的可重复执行脚本、断言、检查命令和清理步骤保存在 [INVENTORY_LOAD_TEST.md](./INVENTORY_LOAD_TEST.md)。
+
 API Gateway also uses Redis to limit each authenticated user to a replenish rate of 5 Ticket requests per second with a burst capacity of 10.
 
 API Gateway 还会通过 Redis 按已登录用户进行限流：每秒补充 5 个请求额度，最大突发容量为 10。

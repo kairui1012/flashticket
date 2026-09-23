@@ -80,3 +80,7 @@ management:
         include:
           - health
           - info
+logging:
+  level:
+    root: WARN
+    com.flashticket.inventoryservice: INFO

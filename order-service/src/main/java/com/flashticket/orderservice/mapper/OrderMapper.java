@@ -10,6 +10,11 @@ import java.util.List;
 @Mapper
 public interface OrderMapper {
 
+    Order findByUserIdAndTicketId(
+            @Param("userId") String userId,
+            @Param("ticketId") String ticketId
+    );
+
     int insert(Order order);
 
     Order findById(@Param("orderId") String orderId);

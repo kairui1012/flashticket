@@ -1,3 +1,6 @@
 spring:
   application:
     name: order-service
+
+ticket-service:
+  base-url: ${TICKET_SERVICE_BASE_URL:http://localhost:8082}

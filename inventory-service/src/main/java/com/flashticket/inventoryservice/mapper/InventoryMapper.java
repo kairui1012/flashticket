@@ -9,9 +9,9 @@ public interface InventoryMapper {
 
     Inventory findByTicketId(@Param("ticketId") String ticketId);
 
-    int insert(Inventory inventory);
+    void insert(Inventory inventory);
 
-    int updateAvailableStock(
+    void updateAvailableStock(
             @Param("ticketId") String ticketId,
             @Param("availableStock") Integer availableStock
     );

@@ -62,6 +62,17 @@
         )
     </insert>
 
+    <select id="findByUserIdAndTicketId" resultMap="OrderResultMap">
+        SELECT
+            <include refid="OrderColumns"/>
+        FROM orders
+        WHERE user_id = #{userId}
+          AND ticket_id = #{ticketId}
+          AND status = 'PENDING_PAYMENT'
+        ORDER BY created_at DESC
+        LIMIT 1
+    </select>
+
     <select id="findById" resultMap="OrderResultMap">
         SELECT
             <include refid="OrderColumns"/>

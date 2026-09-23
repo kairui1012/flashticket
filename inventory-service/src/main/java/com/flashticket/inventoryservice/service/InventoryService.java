@@ -12,6 +12,7 @@ import com.flashticket.inventoryservice.event.InventoryReleaseEvent;
 import com.flashticket.inventoryservice.event.InventoryReservedEvent;
 import com.flashticket.inventoryservice.mapper.InventoryMapper;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpStatus;
@@ -22,13 +23,13 @@ import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
-import java.time.ZoneId;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 
 public class InventoryService {
 
@@ -53,7 +54,6 @@ public class InventoryService {
     private final KafkaTemplate<String,Object> kafkaTemplate;
     private static final String RESERVED_TOPIC = "inventory.reserved";
     private static final String RELEASE_TOPIC = "inventory.release";
-    private static final String RESERVATION_TIMEOUTS_KEY = "inventory:reservation:timeouts";
 
     /**
      * Creates the initial inventory for a ticket.
@@ -381,17 +381,6 @@ public class InventoryService {
             );
         }
 
-        // TODO: Enable reservation timeout scheduling after Order Service is completed.
-//        long expireAt = System.currentTimeMillis() + Duration.ofMinutes(5).toMillis();
-//
-//        stringRedisTemplate.opsForZSet()
-//                .add(
-//                        RESERVATION_TIMEOUTS_KEY,
-//                        reservationKey,
-//                        expireAt
-//                );
-
-
         // STEP 5 -> Create a unique event for idempotent MySQL synchronization.
         // eventId allows the consumer to implement idempotency when Kafka redelivers a message.
         InventoryReservedEvent event = new InventoryReservedEvent(
@@ -403,18 +392,38 @@ public class InventoryService {
         );
 
 
-
-
-        // STEP 6 -> Send the event and wait for Kafka acknowledgement.
-        // If publishing fails, compensate Redis atomically before returning an error.
+        // STEP 6 -> Submit the event to Kafka asynchronously.
+        // If publishing fails later, compensate Redis inside the completion callback.
         try {
             kafkaTemplate.send(
                     RESERVED_TOPIC,
                     request.getTicketId(),
                     event
-            ).get();
+            ).whenComplete((sendResult, exception) -> {
+
+                if (exception != null) {
+                    log.error(
+                            "Failed to publish reserved event, ticketId={}",
+                            request.getTicketId(),
+                            exception
+                    );
+
+                    Long compensationResult =
+                            compensateReservation(stockKey, reservationKey);
+
+                    if (!Objects.equals(compensationResult, 1L)) {
+                        log.error(
+                                "Kafka publishing and Redis compensation both failed, ticketId={}",
+                                request.getTicketId()
+                        );
+                    }
+                }
+            });
+
         } catch (Exception exception) {
-            Long compensationResult = compensateReservation(stockKey, reservationKey);
+
+            Long compensationResult =
+                    compensateReservation(stockKey, reservationKey);
 
             if (!Objects.equals(compensationResult, 1L)) {
                 throw new ResponseStatusException(
@@ -462,7 +471,7 @@ public class InventoryService {
                 CACHE_TTL
         );
 
-        // STEP 12 -> Return only after Redis reservation and Kafka publishing both succeed.
+        // STEP 12 -> Return after submitting the Kafka send; its acknowledgement may arrive later.
         return response;
     }
 
@@ -615,12 +624,17 @@ public class InventoryService {
     }
 
     /*
-     * Reservations are accepted only while the configured sale window is active.
-     * Terminal ticket statuses always block reservations. DRAFT is allowed during
-     * the time window because Ticket Service does not yet persist an automatic
-     * DRAFT-to-ON_SALE transition.
+     * Checks Redis first so Ticket Service is called only when eligibility has not
+     * already been cached. A successful check is cached until the ticket sale ends.
      */
     private void ensureTicketCanBeReserved(String ticketId) {
+        String eligibilityKey = ticketReservationEligibilityKey(ticketId);
+        String cachedEligibility = stringRedisTemplate.opsForValue().get(eligibilityKey);
+
+        if ("ELIGIBLE".equals(cachedEligibility)) {
+            return;
+        }
+
         TicketScheduleResponse ticket = ticketClient.getTicketById(ticketId);
         LocalDateTime saleStartTime = ticket.getSaleStartTime();
         LocalDateTime saleEndTime = ticket.getSaleEndTime();
@@ -664,6 +678,19 @@ public class InventoryService {
                     "Ticket sale has ended"
             );
         }
+
+        Duration eligibilityTtl = Duration.between(now, saleEndTime);
+
+        stringRedisTemplate.opsForValue().set(
+                eligibilityKey,
+                "ELIGIBLE",
+                eligibilityTtl
+        );
+    }
+
+    // Caches successful reservation eligibility checks until the ticket sale ends.
+    private String ticketReservationEligibilityKey(String ticketId) {
+        return "ticket:reservation-eligible:" + ticketId;
     }
 
     // Identifies one user's reserved quantity for a ticket.

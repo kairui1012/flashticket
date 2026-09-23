@@ -1,10 +1,5 @@
 package com.flashticket.orderservice.controller;
 
-import com.flashticket.inventoryservice.dto.InsertInventoryRequest;
-import com.flashticket.inventoryservice.dto.InventoryResponse;
-import com.flashticket.inventoryservice.dto.ReleaseStockRequest;
-import com.flashticket.inventoryservice.dto.ReserveStockRequest;
-import com.flashticket.inventoryservice.service.InventoryService;
 import com.flashticket.orderservice.dto.CreateOrderRequest;
 import com.flashticket.orderservice.dto.OrderResponse;
 import com.flashticket.orderservice.service.OrderService;
