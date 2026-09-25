@@ -348,6 +348,7 @@ public class InventoryService {
      * Lua arguments:
      * KEYS[1] = available-stock key
      * KEYS[2] = stock reserved by this user for this ticket
+     * KEYS[3] = sold-out marker for this ticket
      * ARGV[1] = quantity requested by the user
     */
     public InventoryResponse reserveStock(ReserveStockRequest request) {
@@ -361,6 +362,7 @@ public class InventoryService {
                 request.getTicketId(),
                 request.getUserId()
         );
+        String soldOutKey = inventorySoldOutKey(request.getTicketId());
 
         // STEP 3 -> Execute Lua with the stock key, user reservation key, and requested quantity.
         // Lua validates the request and deducts the stock atomically inside Redis.
@@ -368,7 +370,8 @@ public class InventoryService {
                 redisConfig.reserveStockScript(),
                 List.of(
                         stockKey,
-                        reservationKey
+                        reservationKey,
+                        soldOutKey
                 ),
                 String.valueOf(request.getReservedStock())
         );
@@ -410,7 +413,7 @@ public class InventoryService {
                     );
 
                     Long compensationResult =
-                            compensateReservation(stockKey, reservationKey);
+                            compensateReservation(stockKey, reservationKey, soldOutKey);
 
                     if (!Objects.equals(compensationResult, 1L)) {
                         log.error(
@@ -424,7 +427,7 @@ public class InventoryService {
         } catch (Exception exception) {
 
             Long compensationResult =
-                    compensateReservation(stockKey, reservationKey);
+                    compensateReservation(stockKey, reservationKey, soldOutKey);
 
             if (!Objects.equals(compensationResult, 1L)) {
                 throw new ResponseStatusException(
@@ -471,6 +474,7 @@ public class InventoryService {
                 request.getTicketId(),
                 request.getUserId()
         );
+        String soldOutKey = inventorySoldOutKey(request.getTicketId());
 
         // STEP 2 -> Create a unique release event for idempotent MySQL synchronization.
         // The Lua script atomically verifies this quantity against the stored reservation
@@ -484,21 +488,37 @@ public class InventoryService {
         );
 
         // STEP 3 -> Atomically validate and return the reserved quantity to Redis stock, then delete
-        // the user's reservation key. KEYS[1] is stock and KEYS[2] is the reservation.
+        // the user's reservation key. KEYS[1] is stock, KEYS[2] is the reservation,
+        // and KEYS[3] is the sold-out marker.
         Long result = stringRedisTemplate.execute(
                 redisConfig.releaseScript(),
-                List.of(stockKey, reservationKey),
+                List.of(stockKey, reservationKey, soldOutKey),
                 String.valueOf(request.getReservedStock())
         );
 
         // STEP 4 -> A non-negative result is the remaining stock after a successful release.
         // Negative values are failure codes returned by the Lua script.
-        if (result == null || result < 0) {
+        if (result == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Unable to execute inventory release"
+            );
+        }
+
+        if (result == -4L) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Reservation does not exist"
+            );
+        }
+
+        if (result < 0) {
             throw new ResponseStatusException(
                     HttpStatus.CONFLICT,
                     "Unable to release the reserved stock"
             );
         }
+
 
         // STEP 5 -> Publish the release event and wait for Kafka acknowledgement.
         // If publishing fails, reserve the same quantity again to compensate Redis.
@@ -511,7 +531,7 @@ public class InventoryService {
         } catch (Exception exception) {
             Long compensationResult = stringRedisTemplate.execute(
                     redisConfig.reserveStockScript(),
-                    List.of(stockKey, reservationKey),
+                    List.of(stockKey, reservationKey, soldOutKey),
                     String.valueOf(request.getReservedStock())
             );
 
@@ -676,13 +696,23 @@ public class InventoryService {
         return "inventory:release:" + ticketId + ":" + userId;
     }
 
+    private String inventorySoldOutKey(String ticketId) {
+        return "inventory:sold-out:" + ticketId;
+    }
+
+
     // Restores Redis stock when the reservation event cannot be published to Kafka.
-    private Long compensateReservation(String stockKey, String reservationKey) {
+    private Long compensateReservation(
+            String stockKey,
+            String reservationKey,
+            String soldOutKey
+    ) {
         return stringRedisTemplate.execute(
                 redisConfig.compensateScript(),
                 List.of(
                         stockKey,
-                        reservationKey
+                        reservationKey,
+                        soldOutKey
                 )
         );
     }

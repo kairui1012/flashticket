@@ -10,6 +10,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
 
 @RequiredArgsConstructor
 @RestController
@@ -66,12 +67,23 @@ public class InventoryController {
     }
 
     // Reserves stock by moving the requested quantity from available to reserved.
-    @PostMapping("/reserve")
+    @PostMapping("/{ticketId}/reserve")
     public ResponseEntity<InventoryResponse> reserveStock(
+            @PathVariable String ticketId,
             @Valid @RequestBody ReserveStockRequest request
     ) {
-        return ResponseEntity.ok(inventoryService.reserveStock(request));
+        if (!ticketId.equals(request.getTicketId())) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "Ticket ID in path and request body must match"
+            );
+        }
+
+        return ResponseEntity.ok(
+                inventoryService.reserveStock(request)
+        );
     }
+
 
     // Releases reserved stock by moving the requested quantity back to available.
     @PostMapping("/release")

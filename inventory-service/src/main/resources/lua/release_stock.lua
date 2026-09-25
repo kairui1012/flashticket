@@ -4,7 +4,7 @@
 -- 3. Check whether the user's reservation still exists.
 -- 4. Confirm that the stored reservation matches the requested release quantity.
 -- 5. Return the reserved quantity to available stock.
--- 6. Delete the user's reservation key.
+-- 6. Delete the user's reservation key and sold-out marker.
 
 -- Return values:
 -- 0 or greater = Release succeeded; the value is the remaining stock.
@@ -15,6 +15,7 @@
 
 local stockKey = KEYS[1]
 local reservationKey = KEYS[2]
+local soldOutKey = KEYS[3]
 local quantity = tonumber(ARGV[1])
 
 if not quantity or quantity <= 0 then
@@ -39,5 +40,6 @@ end
 
 local remainingStock = redis.call("INCRBY", stockKey, quantity)
 redis.call("DEL", reservationKey)
+redis.call("DEL", soldOutKey)
 
 return remainingStock

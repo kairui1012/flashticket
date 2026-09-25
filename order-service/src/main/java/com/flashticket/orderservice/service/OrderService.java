@@ -1,8 +1,10 @@
 package com.flashticket.orderservice.service;
 
+import com.flashticket.orderservice.client.InventoryClient;
 import com.flashticket.orderservice.client.TicketClient;
 import com.flashticket.orderservice.dto.CreateOrderRequest;
 import com.flashticket.orderservice.dto.OrderResponse;
+import com.flashticket.orderservice.dto.ReleaseInventoryRequest;
 import com.flashticket.orderservice.dto.TicketPriceResponse;
 import com.flashticket.orderservice.entity.Order;
 import com.flashticket.orderservice.entity.OrderStatus;
@@ -12,6 +14,7 @@ import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.http.HttpStatus;
+import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
@@ -22,14 +25,21 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
 
+import static com.flashticket.orderservice.entity.OrderStatus.CANCELLED;
+
 @Service
 @RequiredArgsConstructor
+
 public class OrderService {
 
-    private static final Duration ORDER_CACHE_TTL = Duration.ofMinutes(10);
+    private static final Duration ORDER_CACHE_TTL = Duration.ofMinutes(5);
 
     private final KafkaTemplate<String,Order> kafkaTemplate;
     private final RedisTemplate<String, OrderResponse> redisTemplate;
+    private final RedisTemplate<String, List<OrderResponse>> redisTemplateForOrderList;
+
+    private final InventoryClient inventoryClient;
+
     private final OrderMapper orderMapper;
     private final TicketClient ticketClient;
 
@@ -104,19 +114,132 @@ public class OrderService {
     }
 
     public OrderResponse getOrderById(String orderId) {
+        String key = orderCacheKey(orderId);
+
+        OrderResponse cached = redisTemplate.opsForValue().get(key);
+
+        if (cached != null) {
+            return cached;
+        }
+
+        Order order = orderMapper.findById(orderId);
+
+        if (order == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.NOT_FOUND,
+                    "Order not found: " + orderId
+            );
+        }
+
+        OrderResponse response = mapToResponse(order);
+
+        redisTemplate.opsForValue().set(
+                key,
+                response,
+                ORDER_CACHE_TTL
+        );
+
+        return response;
     }
 
     public List<OrderResponse> getOrdersByUserId(String userId) {
+        String key = userOrdersKey(userId);
+
+        List<OrderResponse> cached =
+                redisTemplateForOrderList.opsForValue().get(key);
+
+        if (cached != null) {
+            return cached;
+        }
+
+        List<OrderResponse> responses = orderMapper.findByUserId(userId)
+                .stream()
+                .map(this::mapToResponse)
+                .toList();
+
+        redisTemplateForOrderList.opsForValue().set(
+                key,
+                responses,
+                ORDER_CACHE_TTL
+        );
+
+        return responses;
     }
+
 
     public OrderResponse cancelOrder(String orderId) {
+        Order order = orderMapper.findById(orderId);
+
+        if (order == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.NOT_FOUND,
+                    "Order not found: " + orderId
+            );
+        }
+
+        if (order.getStatus() == OrderStatus.CANCELLED) {
+            return mapToResponse(order);
+        }
+
+        if (order.getStatus() != OrderStatus.PENDING_PAYMENT) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Only a pending payment order can be cancelled"
+            );
+        }
+
+        LocalDateTime now = LocalDateTime.now();
+
+        // 条件更新：只有 PENDING_PAYMENT 才能取消
+        int updatedRows = orderMapper.cancelPendingOrder(orderId, now);
+
+        if (updatedRows != 1) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Order status has already changed"
+            );
+        }
+
+        ReleaseInventoryRequest releaseRequest =
+                new ReleaseInventoryRequest(
+                        order.getTicketId(),
+                        order.getUserId(),
+                        order.getQuantity()
+                );
+
+        inventoryClient.releaseStock(releaseRequest);
+
+        order.setStatus(OrderStatus.CANCELLED);
+        order.setUpdatedAt(now);
+
+        OrderResponse response = mapToResponse(order);
+
+        redisTemplate.opsForValue().set(
+                orderCacheKey(orderId),
+                response,
+                ORDER_CACHE_TTL
+        );
+
+        // 用户订单列表缓存也已经过期
+        redisTemplateForOrderList.delete(
+                userOrdersKey(order.getUserId())
+        );
+
+        return response;
     }
 
+
+
     public OrderResponse markAsPaid(String orderId) {
+
     }
 
     private String orderCacheKey(String orderId) {
         return "order:" + orderId;
+    }
+
+    private String userOrdersKey(String userId) {
+        return "orders:user:" + userId;
     }
 
     private BigDecimal calculateTotalAmount(BigDecimal unitPrice, Integer quantity) {

@@ -2,7 +2,7 @@
 -- 1. Check whether the stock key still exists.
 -- 2. Read the quantity stored in the user's reservation key.
 -- 3. Return the reserved quantity to available stock.
--- 4. Delete the reservation key so the user can try again.
+-- 4. Delete the reservation key and sold-out marker so the user can try again.
 
 -- Return codes:
 -- 1 = Compensation succeeded.
@@ -11,6 +11,7 @@
 
 local stockKey = KEYS[1]
 local reservationKey = KEYS[2]
+local soldOutKey = KEYS[3]
 
 if redis.call("EXISTS", stockKey) == 0 then
     return -1
@@ -24,5 +25,6 @@ end
 
 redis.call("INCRBY", stockKey, tonumber(quantity))
 redis.call("DEL", reservationKey)
+redis.call("DEL", soldOutKey)
 
 return 1
