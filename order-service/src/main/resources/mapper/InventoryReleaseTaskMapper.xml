@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.flashticket.orderservice.mapper.InventoryReleaseTaskMapper">
+
+    <resultMap id="InventoryReleaseTaskResultMap"
+               type="com.flashticket.orderservice.entity.InventoryReleaseTask">
+        <id property="id" column="id"/>
+        <result property="orderId" column="order_id"/>
+        <result property="releaseId" column="release_id"/>
+        <result property="ticketId" column="ticket_id"/>
+        <result property="userId" column="user_id"/>
+        <result property="quantity" column="quantity"/>
+        <result property="reason" column="reason"/>
+        <result property="status" column="status"/>
+        <result property="retryCount" column="retry_count"/>
+        <result property="nextRetryAt" column="next_retry_at"/>
+        <result property="lockedAt" column="locked_at"/>
+        <result property="lastError" column="last_error"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <sql id="InventoryReleaseTaskColumns">
+        id,
+        order_id,
+        release_id,
+        ticket_id,
+        user_id,
+        quantity,
+        reason,
+        status,
+        retry_count,
+        next_retry_at,
+        locked_at,
+        last_error,
+        created_at,
+        updated_at
+    </sql>
+
+    <insert id="insertIfAbsent">
+        INSERT IGNORE INTO inventory_release_tasks (
+            id,
+            order_id,
+            release_id,
+            ticket_id,
+            user_id,
+            quantity,
+            reason,
+            status,
+            retry_count,
+            next_retry_at,
+            locked_at,
+            last_error,
+            created_at,
+            updated_at
+        ) VALUES (
+            #{id},
+            #{orderId},
+            #{releaseId},
+            #{ticketId},
+            #{userId},
+            #{quantity},
+            #{reason},
+            #{status},
+            #{retryCount},
+            #{nextRetryAt},
+            #{lockedAt},
+            #{lastError},
+            #{createdAt},
+            #{updatedAt}
+        )
+    </insert>
+
+    <select id="findById" resultMap="InventoryReleaseTaskResultMap">
+        SELECT
+            <include refid="InventoryReleaseTaskColumns"/>
+        FROM inventory_release_tasks
+        WHERE id = #{taskId}
+    </select>
+
+    <select id="findByOrderId" resultMap="InventoryReleaseTaskResultMap">
+        SELECT
+            <include refid="InventoryReleaseTaskColumns"/>
+        FROM inventory_release_tasks
+        WHERE order_id = #{orderId}
+    </select>
+
+    <select id="findReadyTasks" resultMap="InventoryReleaseTaskResultMap">
+        SELECT
+            <include refid="InventoryReleaseTaskColumns"/>
+        FROM inventory_release_tasks
+        WHERE (
+                status IN ('PENDING', 'RETRY')
+                AND next_retry_at &lt;= #{now}
+              )
+           OR (
+                status = 'PROCESSING'
+                AND locked_at &lt;= #{lockExpiredBefore}
+              )
+        ORDER BY next_retry_at ASC
+        LIMIT #{limit}
+    </select>
+
+    <update id="markProcessing">
+        UPDATE inventory_release_tasks
+        SET status = 'PROCESSING',
+            locked_at = #{now},
+            updated_at = #{now}
+        WHERE id = #{taskId}
+          AND (
+                (status IN ('PENDING', 'RETRY') AND next_retry_at &lt;= #{now})
+                OR (status = 'PROCESSING' AND locked_at &lt;= #{lockExpiredBefore})
+              )
+    </update>
+
+    <update id="markSuccess">
+        UPDATE inventory_release_tasks
+        SET status = 'SUCCESS',
+            locked_at = NULL,
+            last_error = NULL,
+            updated_at = #{updatedAt}
+        WHERE id = #{taskId}
+          AND status = 'PROCESSING'
+    </update>
+
+    <update id="markRetry">
+        UPDATE inventory_release_tasks
+        SET status = 'RETRY',
+            retry_count = #{retryCount},
+            next_retry_at = #{nextRetryAt},
+            locked_at = NULL,
+            last_error = #{lastError},
+            updated_at = #{updatedAt}
+        WHERE id = #{taskId}
+          AND status = 'PROCESSING'
+    </update>
+
+    <update id="markDead">
+        UPDATE inventory_release_tasks
+        SET status = 'DEAD',
+            retry_count = #{retryCount},
+            locked_at = NULL,
+            last_error = #{lastError},
+            updated_at = #{updatedAt}
+        WHERE id = #{taskId}
+          AND status = 'PROCESSING'
+    </update>
+
+</mapper>

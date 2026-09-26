@@ -12,4 +12,6 @@ public class ReleaseInventoryRequest {
     private String ticketId;
     private String userId;
     private Integer reservedStock;
+    private String releaseId;
+    private String orderId;
 }
