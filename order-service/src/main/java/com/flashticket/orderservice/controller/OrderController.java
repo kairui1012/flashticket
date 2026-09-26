@@ -18,14 +18,14 @@ public class OrderController {
 
     private final OrderService orderService;
 
-    @PostMapping
-    public ResponseEntity<OrderResponse> createOrder(
-            @Valid @RequestBody CreateOrderRequest request
-    ) {
-        return ResponseEntity
-                .status(HttpStatus.CREATED)
-                .body(orderService.createOrder(request));
-    }
+    //    @PostMapping
+    //    public ResponseEntity<OrderResponse> createOrder(
+    //            @Valid @RequestBody CreateOrderRequest request
+    //    ) {
+    //        return ResponseEntity
+    //                .status(HttpStatus.CREATED)
+    //                .body(orderService.createOrder(request));
+    //    }
 
     @GetMapping("/{orderId}")
     public ResponseEntity<OrderResponse> getOrderById(

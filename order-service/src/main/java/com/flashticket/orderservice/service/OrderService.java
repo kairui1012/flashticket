@@ -1,5 +1,7 @@
 package com.flashticket.orderservice.service;
 
+import com.flashticket.orderservice.client.PaymentClient;
+import com.flashticket.orderservice.event.InventoryReservedEvent;
 import com.flashticket.orderservice.client.InventoryClient;
 import com.flashticket.orderservice.client.TicketClient;
 import com.flashticket.orderservice.dto.CreateOrderRequest;
@@ -38,35 +40,24 @@ public class OrderService {
     private final RedisTemplate<String, OrderResponse> redisTemplate;
     private final RedisTemplate<String, List<OrderResponse>> redisTemplateForOrderList;
 
+    private static final String PAYMENT = "PAYMENT";
+
+    private final PaymentClient paymentClient;
     private final InventoryClient inventoryClient;
 
     private final OrderMapper orderMapper;
     private final TicketClient ticketClient;
 
 
-    public OrderResponse createOrder(@Valid CreateOrderRequest request) {
-
-        Order existing =
-                orderMapper.findByUserIdAndTicketId(request.getUserId(),request.getTicketId());
-
-        if (existing != null) {
-            throw new ResponseStatusException(
-                    HttpStatus.CONFLICT,
-                    "A pending order already exists for ticket "
-                            + request.getTicketId()
-                            + " and user "
-                            + request.getUserId()
-            );
-        }
-
+    public void createOrderFromInventoryEvent(InventoryReservedEvent event) {
         TicketPriceResponse ticket;
 
         try {
-            ticket = ticketClient.getTicketById(request.getTicketId());
+            ticket = ticketClient.getTicketById(event.getTicketId());
         } catch (FeignException.NotFound exception) {
             throw new ResponseStatusException(
                     HttpStatus.NOT_FOUND,
-                    "Ticket not found: " + request.getTicketId()
+                    "Ticket not found: " + event.getTicketId()
             );
         }
 
@@ -77,20 +68,18 @@ public class OrderService {
             );
         }
 
-        LocalDateTime now = LocalDateTime.now();
         Order order = new Order();
-
         order.setId(UUID.randomUUID().toString());
-        order.setUserId(request.getUserId());
-        order.setTicketId(request.getTicketId());
-        order.setQuantity(request.getQuantity());
+        order.setUserId(event.getUserId());
+        order.setTicketId(event.getTicketId());
+        order.setQuantity(event.getQuantity());
         order.setUnitPrice(ticket.getPrice());
-        order.setTotalAmount(calculateTotalAmount(ticket.getPrice(), request.getQuantity()));
+        order.setTotalAmount(calculateTotalAmount(ticket.getPrice() , event.getQuantity()));
         order.setStatus(OrderStatus.PENDING_PAYMENT);
-        order.setCreatedAt(now);
-        order.setExpiresAt(now.plusMinutes(5));
+        order.setCreatedAt(event.getOccurredAt());
+        order.setExpiresAt(LocalDateTime.now().plusMinutes(5));
         order.setPaidAt(null);
-        order.setUpdatedAt(now);
+        order.setUpdatedAt(LocalDateTime.now());
 
         int insertedRows = orderMapper.insert(order);
 
@@ -108,9 +97,6 @@ public class OrderService {
                 response,
                 ORDER_CACHE_TTL
         );
-
-        return response;
-
     }
 
     public OrderResponse getOrderById(String orderId) {
@@ -229,9 +215,27 @@ public class OrderService {
     }
 
 
+    public void markAsPaid(String orderId) {
+        Order order = orderMapper.findById(orderId);
 
-    public OrderResponse markAsPaid(String orderId) {
+        if (order == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.NOT_FOUND,
+                    "Order not found: " + orderId
+            );
+        }
 
+        if (order.getStatus() == OrderStatus.CANCELLED) {
+            return mapToResponse(order);
+        }
+
+        if (order.getStatus() != OrderStatus.PENDING_PAYMENT) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Only a pending payment order can be pay"
+            );
+        }
+        kafkaTemplate.send(PAYMENT,order);
     }
 
     private String orderCacheKey(String orderId) {
@@ -245,6 +249,76 @@ public class OrderService {
     private BigDecimal calculateTotalAmount(BigDecimal unitPrice, Integer quantity) {
         return unitPrice.multiply(BigDecimal.valueOf(quantity));
     }
+
+    //    Current no use（just put here for future？）
+    //    public OrderResponse createOrder(@Valid CreateOrderRequest request) {
+    //
+    //        Order existing =
+    //                orderMapper.findByUserIdAndTicketId(request.getUserId(),request.getTicketId());
+    //
+    //        if (existing != null) {
+    //            throw new ResponseStatusException(
+    //                    HttpStatus.CONFLICT,
+    //                    "A pending order already exists for ticket "
+    //                            + request.getTicketId()
+    //                            + " and user "
+    //                            + request.getUserId()
+    //            );
+    //        }
+    //
+    //        TicketPriceResponse ticket;
+    //
+    //        try {
+    //            ticket = ticketClient.getTicketById(request.getTicketId());
+    //        } catch (FeignException.NotFound exception) {
+    //            throw new ResponseStatusException(
+    //                    HttpStatus.NOT_FOUND,
+    //                    "Ticket not found: " + request.getTicketId()
+    //            );
+    //        }
+    //
+    //        if (ticket.getPrice() == null || ticket.getPrice().compareTo(BigDecimal.ZERO) < 0) {
+    //            throw new ResponseStatusException(
+    //                    HttpStatus.CONFLICT,
+    //                    "Ticket price is not configured"
+    //            );
+    //        }
+    //
+    //        LocalDateTime now = LocalDateTime.now();
+    //        Order order = new Order();
+    //
+    //        order.setId(UUID.randomUUID().toString());
+    //        order.setUserId(request.getUserId());
+    //        order.setTicketId(request.getTicketId());
+    //        order.setQuantity(request.getQuantity());
+    //        order.setUnitPrice(ticket.getPrice());
+    //        order.setTotalAmount(calculateTotalAmount(ticket.getPrice(), request.getQuantity()));
+    //        order.setStatus(OrderStatus.PENDING_PAYMENT);
+    //        order.setCreatedAt(now);
+    //        order.setExpiresAt(now.plusMinutes(5));
+    //        order.setPaidAt(null);
+    //        order.setUpdatedAt(now);
+    //
+    //        int insertedRows = orderMapper.insert(order);
+    //
+    //        if (insertedRows != 1) {
+    //            throw new ResponseStatusException(
+    //                    HttpStatus.INTERNAL_SERVER_ERROR,
+    //                    "Unable to create the order"
+    //            );
+    //        }
+    //
+    //        OrderResponse response = mapToResponse(order);
+    //
+    //        redisTemplate.opsForValue().set(
+    //                orderCacheKey(order.getId()),
+    //                response,
+    //                ORDER_CACHE_TTL
+    //        );
+    //
+    //        return response;
+    //
+    //    }
 
     private OrderResponse mapToResponse(Order order) {
         OrderResponse response = new OrderResponse();
@@ -262,4 +336,6 @@ public class OrderService {
 
         return response;
     }
+
+
 }
