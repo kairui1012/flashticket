@@ -32,10 +32,8 @@ public class OrderEventConsumer {
     public void handleInventoryReserved(InventoryReservedEvent event) {
 
         // STEP 1 -> Validate the Kafka payload before using it in idempotency or stock updates.
-        if (validateEvent(event)) {
-            throw new IllegalArgumentException("Invalid inventory reserved event");
-        }
-
+        validateEvent(event);
+        
         // STEP 2 -> Build the processed-event record using Kafka's stable event ID.
         ProcessedEvent processedEvent = new ProcessedEvent(
                 event.getEventId(),
@@ -61,12 +59,12 @@ public class OrderEventConsumer {
                 event.getQuantity()
         );
 
-        // 如果这里失败，异常继续抛出，让事务回滚、Kafka 重试
+        // Propagate failures so the transaction rolls back and Kafka can retry the event.
         orderService.createOrderFromInventoryEvent(event);
 
     }
 
-    private Boolean validateEvent(InventoryReservedEvent event) {
+    private void validateEvent(InventoryReservedEvent event) {
         if (event == null
                 || event.getEventId() == null
                 || event.getEventId().isBlank()
@@ -77,11 +75,11 @@ public class OrderEventConsumer {
                 || event.getQuantity() == null
                 || event.getQuantity() <= 0
                 || event.getOccurredAt() == null) {
+
             throw new IllegalArgumentException(
                     "Invalid inventory reserved event"
             );
         }
-        return true;
     }
 
 }

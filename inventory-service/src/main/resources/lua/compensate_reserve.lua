@@ -13,6 +13,7 @@ local stockKey = KEYS[1]
 local reservationKey = KEYS[2]
 local soldOutKey = KEYS[3]
 
+
 if redis.call("EXISTS", stockKey) == 0 then
     return -1
 end

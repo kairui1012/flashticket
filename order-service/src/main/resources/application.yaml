@@ -28,15 +28,30 @@ spring:
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
       acks: all
       retries: 10
       properties:
         enable.idempotence: true
         max.in.flight.requests.per.connection: 5
         spring.json.add.type.headers: true
+
+    consumer:
+      group-id: order-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+      properties:
+        spring.json.trusted.packages: com.flashticket.orderservice.event
+        spring.json.use.type.headers: false
+        spring.json.value.default.type: com.flashticket.orderservice.event.InventoryReservedEvent
+
+    listener:
+      ack-mode: record
 
 mybatis:
   mapper-locations: classpath:mapper/*.xml
@@ -48,6 +63,19 @@ ticket-service:
 
 inventory-service:
   base-url: ${INVENTORY_SERVICE_BASE_URL:http://localhost:8083}
+
+payment-service:
+  base-url: ${PAYMENT_SERVICE_BASE_URL:http://localhost:8085}
+
+order:
+  expiration:
+    scan-delay-ms: ${ORDER_EXPIRATION_SCAN_DELAY_MS:5000}
+    initial-delay-ms: ${ORDER_EXPIRATION_INITIAL_DELAY_MS:15000}
+
+inventory:
+  release:
+    worker-delay-ms: ${INVENTORY_RELEASE_WORKER_DELAY_MS:5000}
+    worker-initial-delay-ms: ${INVENTORY_RELEASE_WORKER_INITIAL_DELAY_MS:15000}
 
 management:
   endpoints:

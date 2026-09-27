@@ -19,7 +19,7 @@ local reservationKey = KEYS[2]
 local soldOutKey = KEYS[3]
 
 local quantity = tonumber(ARGV[1])
-local reservationTtlSeconds = 300
+local reservationTtlSeconds = 900
 
 if not quantity or quantity <= 0 then
     return -3

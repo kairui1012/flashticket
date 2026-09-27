@@ -12,7 +12,7 @@ FlashTicket 是一个面向高并发抢票场景的微服务后端项目。系�
 - Ticket creation, lookup, update, cancellation, and Redis caching
 - Inventory creation, lookup, and manual stock adjustment
 - Atomic reservation and release through Redis Lua scripts
-- Per-user reservation keys with a five-minute TTL
+- Per-user reservation keys with a 15-minute safety TTL
 - Kafka-based `inventory.reserved` and `inventory.release` processing
 - Idempotent MySQL synchronization through processed-event records
 - Flyway database migrations for Auth, Ticket, and Inventory services
@@ -20,9 +20,9 @@ FlashTicket 是一个面向高并发抢票场景的微服务后端项目。系�
 
 已实现用户注册登录、JWT 权限控制、票种管理、库存管理、Redis 原子预留与释放、Kafka 库存事件、MySQL 幂等同步、网关路由及限流。
 
-> `order-service` is under development. Order creation has partial implementation, while query, cancellation, payment completion, database configuration, and Gateway routing are not complete.
+> `order-service` now supports Kafka-driven order creation, queries, cancellation, payment marking, five-minute expiration, and retryable inventory release. Gateway routing and the complete payment workflow remain under development.
 >
-> `order-service` 正在开发中。目前仅部分实现订单创建；订单查询、取消、支付完成、数据库配置及 Gateway 路由尚未完成。
+> `order-service` 目前已支持 Kafka 驱动的订单创建、查询、取消、支付标记、五分钟过期及库存释放重试；Gateway 路由与完整支付流程仍在开发中。
 
 ## Architecture / 架构
 
@@ -67,7 +67,7 @@ FlashTicket/
 ├── auth-service/       # Registration, login, and JWT generation
 ├── ticket-service/     # Ticket management and Redis caching
 ├── inventory-service/  # Atomic inventory reservation and Kafka synchronization
-├── order-service/      # Incomplete order workflow under development
+├── order-service/      # Order lifecycle and retryable inventory release
 ├── docker/mysql/init/  # Local service-database initialization
 ├── jmeter/             # JMeter data and result screenshots
 ├── keys/               # Local RSA keys
@@ -83,6 +83,7 @@ FlashTicket/
 | Auth Service | `8081` |
 | Ticket Service | `8082` |
 | Inventory Service | `8083` |
+| Order Service | `8084` |
 | MySQL | `3307` |
 | Redis | `6379` |
 | Kafka | `9092` |
@@ -143,17 +144,23 @@ cd inventory-service
 ```
 
 ```bash
+cd order-service
+./mvnw spring-boot:run
+```
+
+```bash
 cd api-gateway
 ./mvnw spring-boot:run
 ```
 
-Ticket and Inventory expose direct health checks. Auth and Gateway currently protect non-API paths through their security configuration.
+Ticket, Inventory, and Order expose direct health checks. Auth and Gateway currently protect non-API paths through their security configuration.
 
-Ticket 与 Inventory 提供直接健康检查；Auth 与 Gateway 当前会通过安全配置保护非 API 路径。
+Ticket、Inventory 与 Order 提供直接健康检查；Auth 与 Gateway 当前会通过安全配置保护非 API 路径。
 
 ```bash
 curl http://localhost:8082/actuator/health
 curl http://localhost:8083/actuator/health
+curl http://localhost:8084/actuator/health
 ```
 
 ## API overview / API 概览
@@ -244,13 +251,27 @@ curl -X POST http://localhost:8080/api/v1/inventory/release \
 | `inventory:{ticketId}` | Inventory detail cache |
 | `inventory:not-found:{ticketId}` | Inventory negative cache, 30-second TTL |
 | `inventory:stock:{ticketId}` | Atomic available-stock counter |
-| `inventory:reserved:{ticketId}:{userId}` | Per-user reservation, five-minute TTL |
+| `inventory:reserved:{ticketId}:{userId}` | Per-user reservation, 15-minute safety TTL |
 | `inventory.reserved` | Successful reservation event |
 | `inventory.release` | Reservation release event |
 
 Redis is the concurrency boundary for reservation and release. Kafka consumers synchronize successful changes to MySQL and use `processed_events` for event idempotency.
 
 Redis 是库存并发控制边界；Kafka Consumer 将成功变更同步至 MySQL，并通过 `processed_events` 保证事件幂等。
+
+## Order and inventory runtime validation / 订单与库存实机验证
+
+The reservation, cancellation, expiration, idempotent release, and retry paths were validated against the running services on 2026-09-27. The checks used real HTTP requests, Redis, Kafka, and MySQL; they were not mocked or limited to unit tests.
+
+以下预留、取消、过期、幂等释放及故障重试流程已于 2026-09-27 通过真实 HTTP、Redis、Kafka 与 MySQL 实机验证，并非 Mock 或仅执行单元测试。
+
+| Scenario / 场景 | Observed result / 实测结果 |
+| --- | --- |
+| Normal reservation / 正常预留 | Inventory HTTP returned `200`; Redis available stock changed `10 -> 8`, the reservation key stored `2`, MySQL changed from `10/0` to `8/2` available/reserved, and Order created a `PENDING_PAYMENT` record. |
+| User cancellation / 用户取消 | A quantity-3 reservation changed inventory to `7/3`; cancelling the order returned `200`, changed Order to `CANCELLED`, completed the release task as `SUCCESS` with `retry_count=0`, deleted the Redis reservation key, and restored Redis/MySQL to `10/0`. |
+| Five-minute expiration / 五分钟未付款 | Order `900682f3-d5d1-4c33-b46c-f364ee9d2e35` was created at `15:14:37` with `expires_at=15:19:37`; it remained pending before the deadline and was observed as `EXPIRED` with a `SUCCESS` release task at `15:19:40`. Redis/MySQL were restored from `8/2` to `10/0`. |
+| Duplicate release / 重复释放 | Two release requests with the same `releaseId` both returned `200`. The first restored inventory from `6/4` to `10/0`; the second left it at `10/0`. MySQL stored one processed release event, so stock was released only once. |
+| Inventory outage and retry / Inventory 暂时不可用 | With Inventory Service stopped, the release task entered `RETRY` with `retry_count=1` and a connection-refused error while inventory remained `8/2`. After Inventory Service recovered, the same task became `SUCCESS`, cleared the error, and restored Redis/MySQL to `10/0`. |
 
 ## Load-test result / 压测结果
 
@@ -289,16 +310,16 @@ Separate real-HTTP correctness checks verified exact `100/900` and `1000/9000` s
 
 ## Current limitations / 当前限制
 
-- Reservation keys expire after five minutes, but expiration does not automatically return stock yet.
+- Reservation keys use a 15-minute technical TTL; the five-minute business deadline is enforced by `orders.expires_at` and the release-task worker.
 - Ticket status does not automatically change to `SOLD_OUT` when inventory reaches zero.
 - Kafka reservation publishing is asynchronous; the HTTP response may return before broker acknowledgement, while the failure callback attempts Redis compensation.
-- Order Service remains incomplete and is not routed by API Gateway.
+- Order Service's core expiration and release flow is implemented, but it is not routed by API Gateway yet.
 - Payment, electronic-ticket delivery, notifications, distributed tracing, and production secret management are not implemented.
 
-- 五分钟预留 Key 过期后，库存暂时不会自动归还。
+- 预留 Key 使用 15 分钟技术 TTL；五分钟业务截止时间由 `orders.expires_at` 与释放任务 Worker 执行。
 - 库存归零后，Ticket 状态暂时不会自动变为 `SOLD_OUT`。
 - Kafka 预留事件采用异步提交；HTTP 可能先于 Broker 确认返回，失败回调会尝试补偿 Redis。
-- Order Service 尚未完成，也未接入 API Gateway。
+- Order Service 的核心过期释放流程已实现，但尚未接入 API Gateway。
 - 支付、电子票交付、通知、分布式链路追踪及生产级密钥管理尚未实现。
 
 ## Security / 安全说明

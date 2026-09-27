@@ -45,7 +45,7 @@ public class RedisConfig {
     @Bean
     public DefaultRedisScript<Long> compensateScript(){
         DefaultRedisScript<Long> script = new DefaultRedisScript<>();
-        script.setLocation(new ClassPathResource("lua/compensate.lua"));
+        script.setLocation(new ClassPathResource("lua/compensate_reserve.lua"));
         script.setResultType(Long.class);
         return script;
     }
@@ -55,6 +55,14 @@ public class RedisConfig {
     public DefaultRedisScript<Long> releaseScript(){
         DefaultRedisScript<Long> script = new DefaultRedisScript<>();
         script.setLocation(new ClassPathResource("lua/release_stock.lua"));
+        script.setResultType(Long.class);
+        return script;
+    }
+
+    @Bean
+    public DefaultRedisScript<Long> compensateReleaseScript(){
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+        script.setLocation(new ClassPathResource("lua/compensate_release.lua"));
         script.setResultType(Long.class);
         return script;
     }

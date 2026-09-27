@@ -480,19 +480,21 @@ public class InventoryService {
         // The Lua script atomically verifies this quantity against the stored reservation
         // before the event is published.
         InventoryReleaseEvent event = new InventoryReleaseEvent(
-                UUID.randomUUID().toString(),
+                request.getReleaseId(),
                 request.getTicketId(),
                 request.getUserId(),
                 request.getReservedStock(),
                 LocalDateTime.now()
         );
 
+        String releaseKey = inventoryReleaseKey(request.getReleaseId());
+
         // STEP 3 -> Atomically validate and return the reserved quantity to Redis stock, then delete
         // the user's reservation key. KEYS[1] is stock, KEYS[2] is the reservation,
-        // and KEYS[3] is the sold-out marker.
+        // KEYS[3] is the sold-out marker, and KEYS[4] is the release idempotency key.
         Long result = stringRedisTemplate.execute(
                 redisConfig.releaseScript(),
-                List.of(stockKey, reservationKey, soldOutKey),
+                List.of(stockKey, reservationKey, soldOutKey , releaseKey),
                 String.valueOf(request.getReservedStock())
         );
 
@@ -529,12 +531,20 @@ public class InventoryService {
                     event
             ).get();
         } catch (Exception exception) {
+            // STEP 1: Restore the reservation when the release event cannot be published.
             Long compensationResult = stringRedisTemplate.execute(
-                    redisConfig.reserveStockScript(),
-                    List.of(stockKey, reservationKey, soldOutKey),
-                    String.valueOf(request.getReservedStock())
+                    redisConfig.compensateReleaseScript(),
+                    List.of(
+                            stockKey,
+                            reservationKey,
+                            soldOutKey,
+                            releaseKey
+                    ),
+                    String.valueOf(request.getReservedStock()),
+                    "900"
             );
 
+            // STEP 2: Report an inconsistent state when compensation also fails.
             if (compensationResult == null || compensationResult < 0) {
                 throw new ResponseStatusException(
                         HttpStatus.INTERNAL_SERVER_ERROR,
@@ -542,6 +552,7 @@ public class InventoryService {
                 );
             }
 
+            // STEP 3: Tell the caller to retry the release operation later.
             throw new ResponseStatusException(
                     HttpStatus.SERVICE_UNAVAILABLE,
                     "Unable to publish the inventory release event"
@@ -692,8 +703,8 @@ public class InventoryService {
         return "inventory:reserved:" + ticketId + ":" + userId;
     }
 
-    private String inventoryReleaseKey(String ticketId,String userId){
-        return "inventory:release:" + ticketId + ":" + userId;
+    private String inventoryReleaseKey(String releaseId){
+        return "inventory:release:" + releaseId;
     }
 
     private String inventorySoldOutKey(String ticketId) {

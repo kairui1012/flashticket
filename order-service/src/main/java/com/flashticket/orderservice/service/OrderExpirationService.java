@@ -1,15 +1,18 @@
 package com.flashticket.orderservice.service;
 
+import com.flashticket.orderservice.dto.OrderResponse;
 import com.flashticket.orderservice.entity.ExpireResult;
 import com.flashticket.orderservice.entity.Order;
+import com.flashticket.orderservice.entity.OrderStatus;
 import com.flashticket.orderservice.mapper.OrderMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Component;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.List;
 
 @RequiredArgsConstructor
 @Slf4j
@@ -21,6 +24,8 @@ public class OrderExpirationService {
 
     private final OrderMapper orderMapper;
     private final InventoryReleaseTaskService inventoryReleaseTaskService;
+    private final RedisTemplate<String, OrderResponse> redisTemplate;
+    private final RedisTemplate<String, List<OrderResponse>> redisTemplateForOrderList;
 
     public ExpireResult expireOne(String orderId) {
         Order order = orderMapper.findById(orderId);
@@ -46,9 +51,23 @@ public class OrderExpirationService {
                 order.getTicketId(),
                 order.getUserId(),
                 order.getQuantity(),
-                "PAYMENT_TIMEOUT"
+                OrderStatus.EXPIRED
         );
 
+        // Remove the stale PENDING_PAYMENT entry for this order.
+        redisTemplate.delete(orderCacheKey(order.getId()));
+
+        // Invalidate the user order list so it is rebuilt with the EXPIRED status.
+        redisTemplateForOrderList.delete(userOrdersKey(order.getUserId()));
+
         return ExpireResult.EXPIRED;
+    }
+
+    private String orderCacheKey(String orderId) {
+        return "order:" + orderId;
+    }
+
+    private String userOrdersKey(String userId) {
+        return "orders:user:" + userId;
     }
 }

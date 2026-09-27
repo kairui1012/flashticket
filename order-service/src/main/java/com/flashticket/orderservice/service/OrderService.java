@@ -5,7 +5,6 @@ import com.flashticket.orderservice.event.InventoryReservedEvent;
 import com.flashticket.orderservice.client.InventoryClient;
 import com.flashticket.orderservice.client.TicketClient;
 import com.flashticket.orderservice.dto.OrderResponse;
-import com.flashticket.orderservice.dto.ReleaseInventoryRequest;
 import com.flashticket.orderservice.dto.TicketPriceResponse;
 import com.flashticket.orderservice.entity.Order;
 import com.flashticket.orderservice.entity.OrderStatus;
@@ -34,6 +33,7 @@ public class OrderService {
 
     // Keeps order cache entries for five minutes.
     private static final Duration ORDER_CACHE_TTL = Duration.ofMinutes(5);
+    private static final OrderStatus USER_CANCELLED = CANCELLED;
 
     private final KafkaTemplate<String,Order> kafkaTemplate;
     private final RedisTemplate<String, OrderResponse> redisTemplate;
@@ -102,6 +102,11 @@ public class OrderService {
                 response,
                 ORDER_CACHE_TTL
         );
+
+        // Invalidate the cached user order list so the new order is immediately visible.
+        redisTemplateForOrderList.delete(
+                userOrdersKey(order.getUserId())
+        );
     }
 
     // Returns an order from Redis when available, otherwise loads it from MySQL.
@@ -163,6 +168,8 @@ public class OrderService {
     // Cancels a pending-payment order and releases its reserved inventory.
     @Transactional
     public OrderResponse cancelOrder(String orderId) {
+        String releaseId = UUID.randomUUID().toString();
+
         Order order = orderMapper.findById(orderId);
 
         if (order == null) {
@@ -195,17 +202,14 @@ public class OrderService {
             );
         }
 
-        ReleaseInventoryRequest releaseRequest = inventoryReleaseTaskService.createTask(
-                order.getId(),       // releaseId
-                order.getId(),       // orderId
+        inventoryReleaseTaskService.createTask(
+                releaseId,
+                order.getId(),
                 order.getTicketId(),
                 order.getUserId(),
                 order.getQuantity(),
-                "USER_CANCELLED"
+                USER_CANCELLED
         );
-
-        // Return the reserved quantity to Inventory Service.
-        inventoryClient.releaseStock(releaseRequest);
 
         order.setStatus(OrderStatus.CANCELLED);
         order.setUpdatedAt(now);

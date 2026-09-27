@@ -18,5 +18,12 @@ public class ReleaseStockRequest {
     @NotNull(message = "Reserved stock is required")
     @Positive(message = "Reserved stock must be greater than zero")
     private Integer reservedStock;
+
+    @NotBlank(message = "Release ID is required")
+    private String releaseId;
+
+    @NotBlank(message = "Order ID is required")
+    private String orderId;
+
     private LocalDateTime updatedAt;
 }

@@ -12,7 +12,7 @@ import java.time.LocalDateTime;
 public class InventoryReleaseEvent {
 
     // eventId -> Ensures idempotency so duplicate Kafka delivery does not release MySQL stock twice.
-    private String eventId;
+    private String releaseId;
 
     // ticketId -> Identifies which ticket inventory the consumer must update.
     private String ticketId;
@@ -21,7 +21,7 @@ public class InventoryReleaseEvent {
     private String userId;
 
     // quantity -> Records how many reserved tickets must be returned to available stock.
-    private Integer quantity;
+    private Integer ReservedStock;
 
     // occurredAt -> Records when the stock release event occurred.
     private LocalDateTime occurredAt;

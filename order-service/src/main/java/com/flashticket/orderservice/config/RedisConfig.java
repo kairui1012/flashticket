@@ -7,7 +7,10 @@ import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.serializer.JacksonJsonRedisSerializer;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
+import tools.jackson.databind.JavaType;
 import tools.jackson.databind.ObjectMapper;
+
+import java.util.List;
 
 @Configuration
 public class RedisConfig {
@@ -21,6 +24,27 @@ public class RedisConfig {
         StringRedisSerializer stringSerializer = new StringRedisSerializer();
         JacksonJsonRedisSerializer<OrderResponse> valueSerializer =
                 new JacksonJsonRedisSerializer<>(objectMapper, OrderResponse.class);
+
+        template.setConnectionFactory(connectionFactory);
+        template.setKeySerializer(stringSerializer);
+        template.setHashKeySerializer(stringSerializer);
+        template.setValueSerializer(valueSerializer);
+        template.setHashValueSerializer(valueSerializer);
+
+        return template;
+    }
+
+    @Bean
+    public RedisTemplate<String, List<OrderResponse>> orderListRedisTemplate(
+            RedisConnectionFactory connectionFactory,
+            ObjectMapper objectMapper
+    ) {
+        RedisTemplate<String, List<OrderResponse>> template = new RedisTemplate<>();
+        StringRedisSerializer stringSerializer = new StringRedisSerializer();
+        JavaType listType = objectMapper.getTypeFactory()
+                .constructCollectionType(List.class, OrderResponse.class);
+        JacksonJsonRedisSerializer<List<OrderResponse>> valueSerializer =
+                new JacksonJsonRedisSerializer<>(objectMapper, listType);
 
         template.setConnectionFactory(connectionFactory);
         template.setKeySerializer(stringSerializer);

@@ -103,18 +103,18 @@ public class InventoryEventConsumer {
 
         // STEP 1 -> Validate the release event before using it for idempotency or stock updates.
         if (event == null
-                || event.getEventId() == null
-                || event.getEventId().isBlank()
+                || event.getReleaseId() == null
+                || event.getReleaseId().isBlank()
                 || event.getTicketId() == null
                 || event.getTicketId().isBlank()
-                || event.getQuantity() == null
-                || event.getQuantity() <= 0) {
+                || event.getReservedStock() == null
+                || event.getReservedStock() <= 0) {
             throw new IllegalArgumentException("Invalid inventory release event");
         }
 
         // STEP 2 -> Build the processed-event record using the release event's stable ID.
         ProcessedEvent processedEvent = new ProcessedEvent(
-                event.getEventId(),
+                event.getReleaseId(),
                 EventType.INVENTORY_RELEASED,
                 LocalDateTime.now()
         );
@@ -127,7 +127,7 @@ public class InventoryEventConsumer {
         if (inserted == 0) {
             log.info(
                     "Skipping duplicate inventory released event: eventId={}",
-                    event.getEventId()
+                    event.getReleaseId()
             );
             return;
         }
@@ -135,29 +135,29 @@ public class InventoryEventConsumer {
         // STEP 5 -> Log the new release event before applying its business change.
         log.info(
                 "Processing inventory released event: eventId={}, ticketId={}, quantity={}",
-                event.getEventId(),
+                event.getReleaseId(),
                 event.getTicketId(),
-                event.getQuantity()
+                event.getReservedStock()
         );
 
         // STEP 6 -> Conditionally move stock from reserved back to available in MySQL.
         int updatedRows = inventoryMapper.releaseStock(
                 event.getTicketId(),
-                event.getQuantity()
+                event.getReservedStock()
         );
 
         // STEP 7 -> Throw on failure so both the stock update and processed-event insert roll back.
         // Kafka can then retry the record instead of acknowledging an incomplete release.
         if (updatedRows != 1) {
             throw new IllegalStateException(
-                    "Failed to release inventory in MySQL for event: " + event.getEventId()
+                    "Failed to release inventory in MySQL for event: " + event.getReleaseId()
             );
         }
 
         // STEP 8 -> Finish successfully so Spring can commit MySQL before Kafka advances the offset.
         log.info(
                 "Inventory release applied within the transaction: eventId={}",
-                event.getEventId()
+                event.getReleaseId()
         );
     }
 }
