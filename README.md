@@ -1,8 +1,8 @@
 # FlashTicket
 
-FlashTicket is a work-in-progress microservices backend for high-concurrency ticket sales. It combines JWT-based access control, Redis Lua scripts for atomic stock reservation, Kafka events for asynchronous inventory persistence, MySQL, and an API Gateway.
+FlashTicket is a work-in-progress microservices backend for high-concurrency ticket sales. It combines JWT-based access control, Redis Lua scripts for atomic stock reservation, Kafka events for asynchronous inventory and order processing, MySQL, and an API Gateway.
 
-FlashTicket 是一个面向高并发抢票场景的微服务后端项目。系统使用 JWT 进行权限控制，通过 Redis Lua 脚本原子预留库存，并使用 Kafka 将库存事件异步同步至 MySQL，统一由 API Gateway 对外提供接口。
+FlashTicket 是一个面向高并发抢票场景的微服务后端项目。系统使用 JWT 进行权限控制，通过 Redis Lua 脚本原子预留库存，并使用 Kafka 异步同步库存及创建订单。目前 Auth、Ticket 与 Inventory 已接入 API Gateway，Order 仍通过 `8084` 直接访问。
 
 ## Features / 已实现功能
 
@@ -15,10 +15,12 @@ FlashTicket 是一个面向高并发抢票场景的微服务后端项目。系�
 - Per-user reservation keys with a 15-minute safety TTL
 - Kafka-based `inventory.reserved` and `inventory.release` processing
 - Idempotent MySQL synchronization through processed-event records
-- Flyway database migrations for Auth, Ticket, and Inventory services
+- Kafka-driven `PENDING_PAYMENT` order creation and five-minute expiration
+- Durable inventory-release tasks with retry and idempotent release IDs
+- Flyway database migrations for Auth, Ticket, Inventory, Order, and Payment schemas
 - Docker Compose infrastructure for MySQL, Redis, Kafka, and ZooKeeper
 
-已实现用户注册登录、JWT 权限控制、票种管理、库存管理、Redis 原子预留与释放、Kafka 库存事件、MySQL 幂等同步、网关路由及限流。
+已实现用户注册登录、JWT 权限控制、票种管理、Redis 原子库存预留与释放、Kafka 幂等同步、待支付订单创建、五分钟过期、取消订单及可重试库存释放。
 
 > `order-service` now supports Kafka-driven order creation, queries, cancellation, payment marking, five-minute expiration, and retryable inventory release. Gateway routing and the complete payment workflow remain under development.
 >
@@ -34,6 +36,11 @@ API Gateway :8080
   |-- Auth Service :8081 ------> MySQL
   |-- Ticket Service :8082 ----> MySQL + Redis
   `-- Inventory Service :8083 -> Redis Lua -> Kafka -> MySQL
+                                      |          |
+                                      |          `-> Inventory consumer
+                                      `------------> Order Service :8084 -> MySQL + Redis
+
+Payment Service :8085 (scaffold only; endpoints currently return 501)
 ```
 
 Reservation flow / 库存预留流程：
@@ -42,8 +49,9 @@ Reservation flow / 库存预留流程：
 2. A Redis Lua script checks the user's reservation and decrements stock atomically.
 3. The service submits an `inventory.reserved` event to Kafka.
 4. The Inventory consumer updates MySQL idempotently.
+5. The Order consumer creates a five-minute `PENDING_PAYMENT` order from the same event.
 
-Inventory Service 会先验证票种及销售时间，再通过 Redis Lua 原子扣减库存，随后提交 Kafka 事件，由消费者幂等更新 MySQL。
+Inventory Service 会先验证票种及销售时间，再通过 Redis Lua 原子扣减库存并发布 Kafka 事件；Inventory Consumer 幂等更新 MySQL，Order Consumer 根据同一事件创建五分钟待支付订单。
 
 ## Tech stack / 技术栈
 
@@ -68,6 +76,7 @@ FlashTicket/
 ├── ticket-service/     # Ticket management and Redis caching
 ├── inventory-service/  # Atomic inventory reservation and Kafka synchronization
 ├── order-service/      # Order lifecycle and retryable inventory release
+├── payment-service/    # Payment API/schema scaffold; business methods return 501
 ├── docker/mysql/init/  # Local service-database initialization
 ├── jmeter/             # JMeter data and result screenshots
 ├── keys/               # Local RSA keys
@@ -84,6 +93,7 @@ FlashTicket/
 | Ticket Service | `8082` |
 | Inventory Service | `8083` |
 | Order Service | `8084` |
+| Payment Service | `8085` |
 | MySQL | `3307` |
 | Redis | `6379` |
 | Kafka | `9092` |
@@ -101,15 +111,17 @@ docker compose up -d
 docker compose ps
 ```
 
-On a new MySQL volume, the initialization script creates `flashticket_auths`, `flashticket_ticket`, and `flashticket_inventory`. For an existing volume, create any missing databases manually:
+On a new MySQL volume, the initialization script creates separate Auth, Ticket, Inventory, Order, and Payment databases. For an existing volume, create any missing databases manually:
 
-新的 MySQL Volume 会自动创建三个服务数据库。旧 Volume 若缺少数据库，可手动执行：
+新的 MySQL Volume 会自动创建 Auth、Ticket、Inventory、Order 与 Payment 数据库。旧 Volume 若缺少数据库，可手动执行：
 
 ```bash
 docker exec flashticket-mysql mysql -uroot -proot -e \
   "CREATE DATABASE IF NOT EXISTS flashticket_auths;
    CREATE DATABASE IF NOT EXISTS flashticket_ticket;
-   CREATE DATABASE IF NOT EXISTS flashticket_inventory;"
+   CREATE DATABASE IF NOT EXISTS flashticket_inventory;
+   CREATE DATABASE IF NOT EXISTS flashticket_order;
+   CREATE DATABASE IF NOT EXISTS flashticket_payment;"
 ```
 
 ### 2. Prepare local RSA keys / 准备本地 RSA 密钥
@@ -180,6 +192,11 @@ Auth endpoints are public. Other supported routes should normally be accessed th
 | Ticket | `PATCH /api/v1/tickets/{id}/status/cancel` | `ADMIN` |
 | Inventory | `GET /api/v1/inventory/{ticketId}` | `USER`, `ADMIN` |
 | Inventory | Inventory write endpoints | `ADMIN` |
+| Order | `GET /api/v1/orders/{orderId}` | Direct `8084` only |
+| Order | `GET /api/v1/orders/user/{userId}` | Direct `8084` only |
+| Order | `POST /api/v1/orders/{orderId}/cancel` | Direct `8084` only |
+| Order | `POST /api/v1/orders/{orderId}/paid` | Direct `8084` only; local status transition |
+| Payment | `/api/v1/payments/**` | Direct `8085` scaffold; currently `501` |
 
 ### Authentication / 身份认证
 
@@ -228,7 +245,7 @@ curl -X POST http://localhost:8080/api/v1/inventory/insert \
 ### Reserve and release / 预留与释放
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/inventory/reserve \
+curl -X POST http://localhost:8080/api/v1/inventory/<TICKET_ID>/reserve \
   -H 'Authorization: Bearer <ADMIN_JWT>' \
   -H 'Content-Type: application/json' \
   -d '{"ticketId":"<TICKET_ID>","userId":"<USER_ID>","reservedStock":1}'
@@ -238,7 +255,13 @@ curl -X POST http://localhost:8080/api/v1/inventory/reserve \
 curl -X POST http://localhost:8080/api/v1/inventory/release \
   -H 'Authorization: Bearer <ADMIN_JWT>' \
   -H 'Content-Type: application/json' \
-  -d '{"ticketId":"<TICKET_ID>","userId":"<USER_ID>","reservedStock":1}'
+  -d '{
+    "ticketId":"<TICKET_ID>",
+    "userId":"<USER_ID>",
+    "reservedStock":1,
+    "releaseId":"<STABLE_RELEASE_ID>",
+    "orderId":"<ORDER_ID>"
+  }'
 ```
 
 ## Redis and Kafka / Redis 与 Kafka
@@ -252,6 +275,9 @@ curl -X POST http://localhost:8080/api/v1/inventory/release \
 | `inventory:not-found:{ticketId}` | Inventory negative cache, 30-second TTL |
 | `inventory:stock:{ticketId}` | Atomic available-stock counter |
 | `inventory:reserved:{ticketId}:{userId}` | Per-user reservation, 15-minute safety TTL |
+| `inventory:release:{releaseId}` | Idempotent release result, seven-day TTL |
+| `order:{orderId}` | Order detail cache, five-minute TTL |
+| `orders:user:{userId}` | User order-list cache, five-minute TTL |
 | `inventory.reserved` | Successful reservation event |
 | `inventory.release` | Reservation release event |
 
@@ -314,13 +340,13 @@ Separate real-HTTP correctness checks verified exact `100/900` and `1000/9000` s
 - Ticket status does not automatically change to `SOLD_OUT` when inventory reaches zero.
 - Kafka reservation publishing is asynchronous; the HTTP response may return before broker acknowledgement, while the failure callback attempts Redis compensation.
 - Order Service's core expiration and release flow is implemented, but it is not routed by API Gateway yet.
-- Payment, electronic-ticket delivery, notifications, distributed tracing, and production secret management are not implemented.
+- Payment has controller/DTO/schema scaffolding, but its business methods return `501`; electronic-ticket delivery, notifications, distributed tracing, and production secret management are not implemented.
 
 - 预留 Key 使用 15 分钟技术 TTL；五分钟业务截止时间由 `orders.expires_at` 与释放任务 Worker 执行。
 - 库存归零后，Ticket 状态暂时不会自动变为 `SOLD_OUT`。
 - Kafka 预留事件采用异步提交；HTTP 可能先于 Broker 确认返回，失败回调会尝试补偿 Redis。
 - Order Service 的核心过期释放流程已实现，但尚未接入 API Gateway。
-- 支付、电子票交付、通知、分布式链路追踪及生产级密钥管理尚未实现。
+- Payment 已有 Controller、DTO 与数据库迁移骨架，但业务方法仍返回 `501`；电子票交付、通知、分布式链路追踪及生产级密钥管理尚未实现。
 
 ## Security / 安全说明
 
@@ -328,4 +354,4 @@ The current configuration is for local development only. Do not expose infrastru
 
 当前配置仅用于本地开发。请勿公开暴露基础设施端口、在生产环境使用示例数据库密码，或提交 RSA 私钥。
 
-For the proposed architecture and roadmap, see [DEVELOPMENT.md](./DEVELOPMENT.md).
+For the current service boundaries, order-release flow, known limitations, and roadmap, see [DEVELOPMENT.md](./DEVELOPMENT.md).

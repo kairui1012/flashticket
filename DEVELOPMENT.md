@@ -1,439 +1,291 @@
 # FlashTicket 开发文档
 
-## 1. 项目目标
+## 1. 文档范围
 
-FlashTicket 是一个面向演唱会、活动和其他现场演出的在线票务系统。系统计划支持活动浏览、场次与座位管理、限时锁座、订单创建、在线支付、电子票生成及消息通知。
+本文记录当前仓库已经存在的服务、真实调用链、数据一致性边界、已验证结果和下一阶段工作。它不是一份脱离代码的理想架构草案。
 
-抢票场景会在短时间内产生大量并发请求，因此系统设计的重点包括：
+当前已经跑通的最小业务闭环是：
 
-- 防止同一个座位被重复出售
-- 控制高峰流量，避免服务被瞬间压垮
-- 保证订单、支付和出票状态最终一致
-- 支持失败重试、超时取消和问题追踪
-- 保持各个业务服务能够独立开发和部署
+```text
+库存预留
+  -> Kafka inventory.reserved
+  -> 创建 PENDING_PAYMENT 订单
+  -> 用户取消或五分钟未付款
+  -> 持久化 inventory_release_tasks
+  -> Worker 调用 Inventory Service
+  -> Redis 与 MySQL 库存恢复
+```
 
-> 当前状态：仓库目前只有 `api-gateway` 的基础 Spring Boot 项目。本文其余服务属于建议架构和后续开发计划，不代表已经实现。
+支付平台、电子票和通知尚未形成端到端闭环。
 
-## 2. 当前技术基础
+## 2. 当前服务状态
 
-根据现有 `api-gateway/pom.xml`，项目当前使用：
+| 服务 | 端口 | 当前状态 | 主要存储 |
+| --- | ---: | --- | --- |
+| API Gateway | `8080` | 已实现 Auth、Ticket、Inventory 路由、JWT 校验和部分限流 | Redis |
+| Auth Service | `8081` | 已实现注册、登录、BCrypt 和 RSA JWT | `flashticket_auths` |
+| Ticket Service | `8082` | 已实现票种 CRUD、状态更新和 Redis 缓存 | `flashticket_ticket`、Redis |
+| Inventory Service | `8083` | 已实现库存 CRUD、Redis Lua 原子预留/释放、Kafka 同步和幂等消费 | `flashticket_inventory`、Redis |
+| Order Service | `8084` | 已实现 Kafka 创建订单、查询、取消、支付标记、五分钟过期和释放任务重试 | `flashticket_order`、Redis |
+| Payment Service | `8085` | 仅有 Controller、DTO、实体和 Flyway 表；业务方法当前返回 `501 Not Implemented` | `flashticket_payment` |
 
-| 项目 | 当前配置 |
-| --- | --- |
-| Java | 21 |
-| Spring Boot | 4.1.1 |
-| Spring Cloud | 2025.1.3 |
-| API Gateway | Spring Cloud Gateway Server Web MVC |
-| Security | Spring Security、OAuth2 Resource Server |
-| Cache / Rate Limit | Redis（依赖已加入，尚未配置） |
-| Monitoring | Spring Boot Actuator |
-| Build Tool | Maven Wrapper |
+Order 和 Payment 尚未接入 Gateway。Payment Service 也尚未经过完整运行验证，不能描述为已完成支付功能。
 
-当前 Gateway 还没有路由、安全规则、Redis 连接或限流配置，默认端口为 `8080`。
-
-## 3. 建议的系统架构
+## 3. 当前架构
 
 ```mermaid
 flowchart LR
-    Client[Web / Mobile Client] --> Gateway[API Gateway :8080]
-
-    Gateway --> Identity[Identity Service :8081]
-    Gateway --> Event[Event Service :8082]
+    Client[Client] --> Gateway[API Gateway :8080]
+    Gateway --> Auth[Auth Service :8081]
+    Gateway --> Ticket[Ticket Service :8082]
     Gateway --> Inventory[Inventory Service :8083]
-    Gateway --> Order[Order Service :8084]
-    Gateway --> Payment[Payment Service :8085]
-    Gateway --> Ticket[Ticket Service :8086]
 
-    Identity --> IdentityDB[(Identity DB)]
-    Event --> EventDB[(Event DB)]
-    Inventory --> InventoryDB[(Inventory DB)]
-    Inventory --> Redis[(Redis)]
-    Order --> OrderDB[(Order DB)]
-    Payment --> PaymentDB[(Payment DB)]
-    Ticket --> TicketDB[(Ticket DB)]
+    Auth --> AuthDB[(Auth MySQL)]
+    Ticket --> TicketDB[(Ticket MySQL)]
+    Ticket --> Redis[(Redis)]
 
-    Order <--> Broker[Kafka / RabbitMQ]
-    Payment <--> Broker
-    Ticket <--> Broker
-    Broker --> Notification[Notification Service :8087]
+    Inventory --> Redis
+    Inventory --> Kafka[(Kafka)]
+    Kafka --> InventoryConsumer[Inventory Consumer]
+    Kafka --> Order[Order Service :8084]
+    InventoryConsumer --> InventoryDB[(Inventory MySQL)]
+
+    Order --> OrderDB[(Order MySQL)]
+    Order --> Redis
+    Order -->|release HTTP| Inventory
+
+    Payment[Payment Service :8085<br/>scaffold] --> PaymentDB[(Payment MySQL)]
 ```
 
-开发初期不需要一次完成所有服务。建议先完成一个可以端到端运行的 MVP，再逐步加入高并发和消息队列能力。
+Kafka 的两个消费者使用不同的 consumer group：
 
-## 4. 需要开发的 Service
+- `inventory-service` 消费 `inventory.reserved` 和 `inventory.release`，幂等更新 Inventory MySQL。
+- `order-service` 消费 `inventory.reserved`，幂等创建待支付订单。
 
-### 4.1 API Gateway（现有）
+因此同一条预留事件会分别到达两个服务，而不是在它们之间竞争消费。
 
-目录：`api-gateway/`
+## 4. 核心业务流程
 
-建议端口：`8080`
+### 4.1 正常预留与订单创建
 
-职责：
+1. 客户端调用 `POST /api/v1/inventory/{ticketId}/reserve`。
+2. Inventory Service 通过 Ticket Service 检查销售时间与状态。
+3. `reserve_stock.lua` 原子检查库存和用户预留 Key，并扣减 `inventory:stock:{ticketId}`。
+4. Redis 写入 `inventory:reserved:{ticketId}:{userId}`，技术 TTL 为 900 秒。
+5. Inventory Service 发布 `inventory.reserved`。
+6. Inventory Consumer 在同一数据库事务内写入 `processed_events` 并把 MySQL 库存从 available 移到 reserved。
+7. Order Consumer 在同一数据库事务内记录事件并创建 `PENDING_PAYMENT` 订单。
+8. Order Service 从 Ticket Service 获取权威单价，保存数量、单价、总额和 `expires_at=now+5 minutes`。
 
-- 作为前端访问后端服务的统一入口
-- 根据路径把请求转发到对应的业务服务
-- 验证 JWT Access Token
-- 实现 CORS、安全响应头和统一错误格式
-- 使用 Redis 对登录、查询和抢票接口进行限流
-- 生成或转发 `X-Request-Id`，方便跨服务追踪请求
-- 暴露健康检查，但不向公网泄露敏感 Actuator 信息
+900 秒 Redis TTL 是故障安全缓冲，不是业务付款期限。业务过期时间的唯一依据是 `orders.expires_at`。
 
-建议路由：
+### 4.2 用户取消
 
-| 请求路径 | 目标服务 |
-| --- | --- |
-| `/api/auth/**`、`/api/users/**` | Identity Service |
-| `/api/events/**`、`/api/venues/**` | Event Service |
-| `/api/inventory/**`、`/api/seats/**` | Inventory Service |
-| `/api/orders/**` | Order Service |
-| `/api/payments/**` | Payment Service |
-| `/api/tickets/**` | Ticket Service |
+1. 客户端调用 `POST /api/v1/orders/{orderId}/cancel`。
+2. Order Service 使用条件 SQL，只允许 `PENDING_PAYMENT -> CANCELLED`。
+3. 状态更新成功后，在同一事务中插入一条 `inventory_release_tasks`。
+4. Worker 将任务从 `PENDING` 原子 claim 为 `PROCESSING`。
+5. Worker 使用任务中持久化的 `releaseId` 调用 Inventory Service。
+6. Inventory Service 使用 Lua 恢复 Redis，并发布 `inventory.release`。
+7. Inventory Consumer 通过 `processed_events.event_id` 保证 MySQL 只释放一次。
+8. Worker 将任务更新为 `SUCCESS`。
 
-Gateway 只负责入口层能力，不应该存放订单、支付或座位等业务逻辑。
+重复取消已经取消的订单会直接返回当前订单，不会再次创建释放任务。
 
-### 4.2 Identity Service
+### 4.3 五分钟未付款
 
-建议目录：`identity-service/`
+1. `OrderExpirationScheduler` 每 5 秒查询 `status=PENDING_PAYMENT AND expires_at<=now` 的订单。
+2. `OrderExpirationService` 使用条件 SQL 执行 `PENDING_PAYMENT -> EXPIRED`。
+3. 只有实际更新一行时才创建释放任务，避免支付、取消和过期竞态造成错误释放。
+4. 后续库存释放与用户取消使用同一个 Worker 流程。
 
-建议端口：`8081`
-
-职责：
-
-- 用户注册、登录和登出
-- 密码加密与账户状态管理
-- 签发和刷新 JWT
-- 管理 `CUSTOMER`、`ORGANIZER`、`ADMIN` 等角色
-- 保存用户资料和必要的登录审计信息
-
-主要数据：`users`、`roles`、`refresh_tokens`。
-
-### 4.3 Event Service
-
-建议目录：`event-service/`
-
-建议端口：`8082`
-
-职责：
-
-- 创建和管理活动、演出场次及销售时间
-- 管理场馆、区域、排位和票价等级
-- 提供活动列表、搜索和详情查询
-- 管理活动状态，例如 `DRAFT`、`PUBLISHED`、`ON_SALE`、`ENDED`
-- 提供主办方后台所需的活动管理 API
-
-主要数据：`events`、`sessions`、`venues`、`seat_maps`、`price_tiers`。
-
-图片本身建议保存到对象存储，数据库只保存 URL 和相关元数据。
-
-### 4.4 Inventory Service
-
-建议目录：`inventory-service/`
-
-建议端口：`8083`
-
-职责：
-
-- 管理每个场次的可售座位或可售票数量
-- 查询座位实时状态
-- 在用户下单时临时锁定座位
-- 锁定时间结束后自动释放座位
-- 支付成功后把座位确认为已售出
-- 使用原子操作防止同一个座位被两个订单同时占用
-
-建议座位状态：
+订单状态和库存释放任务状态分开保存：
 
 ```text
-AVAILABLE -> HELD -> SOLD
-                \-> AVAILABLE（超时或订单取消）
+Order: PENDING_PAYMENT -> PAID | CANCELLED | EXPIRED
+
+Release task: PENDING -> PROCESSING -> SUCCESS
+                              \-> RETRY -> PROCESSING
+                              \-> DEAD
 ```
 
-Redis 可以用于短时间锁座和 TTL，但数据库仍然是最终库存记录。确认售出时应使用唯一约束、版本号或条件更新再次检查，不能只依靠前端显示的座位状态。
+### 4.4 释放幂等
 
-### 4.5 Order Service
+释放请求必须包含：
 
-建议目录：`order-service/`
+- `ticketId`
+- `userId`
+- `reservedStock`
+- 稳定且可重用的 `releaseId`
+- `orderId`
 
-建议端口：`8084`
+Redis Lua 使用 `inventory:release:{releaseId}` 保存七天的释放结果。相同 `releaseId` 再次调用时直接返回第一次结果，不会再次增加 Redis 库存。
 
-职责：
+Kafka `inventory.release` 事件继续使用同一个 `releaseId` 作为事件 ID。Inventory MySQL 的 `processed_events.event_id` 是主键，因此重复消息不会再次减少 `reserved_stock`。
 
-- 根据已锁定的座位创建订单
-- 保存订单项目、金额快照和订单状态
-- 生成支付请求所需的业务单号
-- 处理订单超时、用户取消和退款状态
-- 编排库存、支付和出票流程
-- 通过幂等键避免用户重复点击产生多张订单
+### 4.5 Inventory 暂时不可用
 
-建议订单状态：
+Worker 调用 Inventory Service 失败时：
 
-```text
-PENDING_PAYMENT -> PAID -> TICKET_ISSUED -> COMPLETED
-       |             |
-       v             v
-   CANCELLED      REFUNDING -> REFUNDED
-```
+1. 当前任务从 `PROCESSING` 变成 `RETRY`。
+2. `retry_count` 增加并保存 `last_error`。
+3. 下一次执行时间按 `5 seconds * retry_count` 递增。
+4. Inventory 恢复后，Worker 复用原 `releaseId` 重试。
+5. 成功后任务变为 `SUCCESS` 并清空错误。
+6. 达到 3 次失败后任务变为 `DEAD`，需要人工检查或后续补偿工具处理。
 
-订单中应保存购买时的活动名称、场次、座位和价格快照，避免活动资料后续修改影响历史订单。
+`PROCESSING` 锁超过一分钟也可以被重新领取，避免 Worker 中途退出后任务永久卡住。
 
-### 4.6 Payment Service
+## 5. 数据与幂等边界
 
-建议目录：`payment-service/`
+### 5.1 MySQL 表
 
-建议端口：`8085`
-
-职责：
-
-- 对接第三方支付平台
-- 创建支付交易并保存支付状态
-- 验证支付回调或 Webhook 签名
-- 处理重复回调，确保支付操作幂等
-- 发起退款并记录第三方交易编号
-- 发布支付成功或支付失败事件
-
-安全要求：
-
-- 不能信任前端传来的“支付成功”结果
-- 必须以服务端验证过的支付平台回调为准
-- API Key、Webhook Secret 等机密信息只能通过环境变量或 Secret Manager 提供
-- 日志中不能输出银行卡信息、Token 或完整的敏感请求内容
-
-### 4.7 Ticket Service
-
-建议目录：`ticket-service/`
-
-建议端口：`8086`
-
-职责：
-
-- 在确认付款后生成电子票
-- 为每张票生成不可预测的唯一票号
-- 生成带签名的 QR Code 内容
-- 提供用户票夹和票券详情
-- 支持入场验票，并原子地把票券标记为已使用
-- 防止同一张电子票被重复核销
-
-建议票券状态：`ACTIVE`、`USED`、`CANCELLED`、`REFUNDED`。
-
-QR Code 不应只包含可以随意修改的普通票号。可以使用服务端签名的短期或受控 Token，验票时仍需向 Ticket Service 确认最终状态。
-
-### 4.8 Notification Service
-
-建议目录：`notification-service/`
-
-建议端口：`8087`
-
-职责：
-
-- 监听订单、支付、出票和退款事件
-- 发送 Email、SMS 或应用内通知
-- 保存发送结果和失败原因
-- 对临时失败进行有限次数的重试
-- 确保重复消费同一个消息时不会重复发送
-
-通知不应该阻塞支付或出票主流程。即使邮件暂时发送失败，已经成功的订单和电子票也不应回滚。
-
-## 5. 基础设施依赖
-
-| 组件 | 用途 | MVP 是否必需 |
+| 数据库 | 关键表 | 用途 |
 | --- | --- | --- |
-| PostgreSQL 或 MySQL | 保存用户、活动、库存、订单、支付和票券数据 | 是 |
-| Redis | 限流、临时锁座、缓存和短期 Token | 是 |
-| Kafka 或 RabbitMQ | 服务间事件、异步出票与通知 | 第二阶段加入 |
-| Email Provider | 发送订单和电子票通知 | 第二阶段加入 |
-| Object Storage | 保存活动海报等文件 | 可先使用本地文件代替 |
-| Docker Compose | 统一启动本地依赖和服务 | 建议使用 |
-| OpenTelemetry | 分布式追踪 | 稳定后加入 |
-| Prometheus + Grafana | 指标收集和监控 | 稳定后加入 |
+| Auth | `auth_accounts` | 账号、密码哈希、角色和状态 |
+| Ticket | `tickets` | 票种、价格、库存总量和销售窗口 |
+| Inventory | `inventories` | 总库存、可用库存和已预留库存 |
+| Inventory | `processed_events` | Inventory Consumer 幂等记录 |
+| Order | `orders` | 订单金额快照、状态和付款截止时间 |
+| Order | `processed_events` | Order Consumer 幂等记录 |
+| Order | `inventory_release_tasks` | 可重试的库存释放任务 |
+| Payment | `payments` | Payment 骨架表，业务尚未实现 |
 
-每个服务应拥有自己的数据库或独立 schema，并通过 API 或事件交换数据。不要让多个服务直接读写同一组业务表。
+### 5.2 Redis Key
 
-## 6. 核心业务流程
+| Key | 用途 | TTL |
+| --- | --- | ---: |
+| `ticket:{ticketId}` | 票种详情缓存 | 10 分钟 |
+| `ticket:not-found:{ticketId}` | Ticket 防穿透 | 30 秒 |
+| `inventory:{ticketId}` | 库存详情缓存 | 10 分钟 |
+| `inventory:stock:{ticketId}` | Redis 原子可用库存 | 无固定 TTL |
+| `inventory:reserved:{ticketId}:{userId}` | 用户预留数量 | 15 分钟 |
+| `inventory:release:{releaseId}` | 释放幂等结果 | 7 天 |
+| `order:{orderId}` | 单个订单缓存 | 5 分钟 |
+| `orders:user:{userId}` | 用户订单列表缓存 | 5 分钟 |
 
-### 6.1 下单和支付
+### 5.3 Kafka Topic
 
-1. 用户通过 Event Service 查看活动和场次。
-2. 用户通过 Inventory Service 查询可售座位。
-3. Inventory Service 原子地锁定所选座位，并返回 `holdId` 和过期时间。
-4. Order Service 验证 `holdId`，保存价格快照并创建待支付订单。
-5. Payment Service 创建第三方支付交易。
-6. 第三方支付平台调用后端 Webhook。
-7. Payment Service 验证签名并发布 `PaymentSucceeded` 事件。
-8. Order Service 把订单更新为 `PAID`。
-9. Inventory Service 把座位从 `HELD` 更新为 `SOLD`。
-10. Ticket Service 生成电子票。
-11. Notification Service 向用户发送订单成功和电子票通知。
+| Topic | Producer | Consumer | 作用 |
+| --- | --- | --- | --- |
+| `inventory.reserved` | Inventory Service | Inventory Service、Order Service | MySQL 库存预留与订单创建 |
+| `inventory.release` | Inventory Service | Inventory Service | MySQL 库存释放 |
 
-### 6.2 支付超时
+## 6. 当前 API 边界
 
-1. Order Service 将超过支付期限的订单更新为 `CANCELLED`。
-2. Inventory Service 释放对应座位。
-3. 如果迟到的支付回调在取消后到达，应进入退款或人工复核流程，不能直接忽略。
+Gateway 当前只转发：
 
-## 7. 服务间通信原则
+- `/api/v1/auth/**` -> Auth Service
+- `/api/v1/tickets/**` -> Ticket Service
+- `/api/v1/inventory/**` -> Inventory Service
 
-- 用户立即需要结果的查询使用 REST API。
-- 支付成功、订单取消、出票和通知等后续动作使用消息事件。
-- 所有写入接口都应考虑幂等性，尤其是下单、支付回调、退款和验票接口。
-- 消费者处理消息后应记录事件 ID，避免重复消费产生副作用。
-- 数据库更新和事件发布建议使用 Transactional Outbox，避免“数据库成功但消息发送失败”。
-- 跨服务流程不使用分布式数据库事务，使用 Saga 和补偿操作保证最终一致性。
+Order 当前必须直接调用 `http://localhost:8084`：
 
-建议的事件名称：
+| Method | Path | 当前行为 |
+| --- | --- | --- |
+| `GET` | `/api/v1/orders/{orderId}` | 查询单个订单 |
+| `GET` | `/api/v1/orders/user/{userId}` | 查询用户订单 |
+| `POST` | `/api/v1/orders/{orderId}/cancel` | 条件取消并创建释放任务 |
+| `POST` | `/api/v1/orders/{orderId}/paid` | 本地条件更新为 `PAID`，尚未连接可信支付回调 |
 
-```text
-OrderCreated
-OrderCancelled
-PaymentSucceeded
-PaymentFailed
-InventoryConfirmed
-InventoryReleased
-TicketIssued
-RefundCompleted
+Order 的公开 `POST /api/v1/orders` 当前被注释。订单由 `inventory.reserved` 事件创建，不应再并行开启第二条同步创建路径。
+
+Payment 的 `/api/v1/payments/**` 虽然已有 Controller，但业务方法统一返回 `501`。
+
+## 7. 本地运行
+
+先启动基础设施：
+
+```bash
+docker compose up -d
+docker compose ps
 ```
 
-事件至少包含：`eventId`、`eventType`、`occurredAt`、`aggregateId`、`version` 和业务数据。
+当前 Docker Compose 提供 MySQL `3307`、Redis `6379`、Kafka `9092` 和 ZooKeeper。应用服务需要分别启动：
 
-## 8. 安全要求
-
-- 密码使用 BCrypt 或 Argon2 哈希，绝不保存明文密码。
-- Gateway 验证 Token 后，下游服务仍需执行角色和资源归属检查。
-- 抢票、登录、发送验证码和验票接口必须限流。
-- 管理员与主办方接口使用明确的角色授权。
-- 所有输入都需要服务端验证，不能只依靠前端校验。
-- 支付 Webhook 必须验证签名、时间戳和重复事件。
-- 日志应隐藏密码、JWT、支付密钥和个人敏感信息。
-- 生产环境只通过 HTTPS 提供服务。
-
-## 9. 建议的仓库结构
-
-```text
-FlashTicket/
-├── api-gateway/
-├── identity-service/
-├── event-service/
-├── inventory-service/
-├── order-service/
-├── payment-service/
-├── ticket-service/
-├── notification-service/
-├── docker-compose.yml
-├── .env.example
-├── README.md
-└── DEVELOPMENT.md
+```bash
+cd auth-service && ./mvnw spring-boot:run
+cd ticket-service && ./mvnw spring-boot:run
+cd inventory-service && ./mvnw spring-boot:run
+cd order-service && ./mvnw spring-boot:run
 ```
 
-建议各个 Spring Boot 服务内部保持一致结构：
+以上命令应在不同终端执行。Payment 仅在开发其业务实现时启动。
 
-```text
-src/main/java/com/flashticket/<service>/
-├── config/
-├── controller/
-├── dto/
-├── domain/
-├── repository/
-├── service/
-├── event/
-└── exception/
+健康检查：
+
+```bash
+curl http://localhost:8082/actuator/health
+curl http://localhost:8083/actuator/health
+curl http://localhost:8084/actuator/health
 ```
 
-## 10. 环境变量建议
+## 8. 已验证结果
 
-仓库应提供不含真实密码的 `.env.example`，例如：
+2026-09-27 已使用真实 HTTP、Redis、Kafka 和 MySQL 完成以下实机测试：
 
-```dotenv
-JWT_ISSUER=http://localhost:8081
-JWT_PUBLIC_KEY_LOCATION=
+- 正常预留后，Redis available stock 减少、reservation Key 存在、MySQL `reserved_stock` 增加，并创建 `PENDING_PAYMENT` 订单。
+- 用户取消后，订单为 `CANCELLED`、释放任务为 `SUCCESS`，Redis/MySQL 库存恢复。
+- 五分钟未付款订单按 `expires_at` 变为 `EXPIRED`，释放任务成功，库存恢复。
+- 相同 `releaseId` 请求两次均安全返回，Redis 与 MySQL 只释放一次。
+- Inventory Service 暂时不可用时任务进入 `RETRY`；恢复后同一任务变为 `SUCCESS`。
 
-REDIS_HOST=localhost
-REDIS_PORT=6379
+精确时间、库存数值和测试订单 ID 记录在 [README.md](./README.md#order-and-inventory-runtime-validation--订单与库存实机验证)。
 
-DB_HOST=localhost
-DB_PORT=5432
-DB_USERNAME=flashticket
-DB_PASSWORD=change-me
+## 9. 已知限制
 
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+- Order 尚未接入 Gateway，也没有下游资源归属鉴权。
+- `POST /orders/{id}/paid` 只是本地状态转换，不能替代服务端验证过的支付平台回调。
+- Payment Service 业务未实现，尚无支付成功/失败事件闭环。
+- 当前没有 Transactional Outbox；Kafka 发布与业务数据库事务之间仍存在一致性窗口。
+- 释放使用 Order Worker 到 Inventory 的同步 HTTP；已有重试，但还没有管理端重放或对账任务。
+- `inventory_release_tasks=DEAD` 后没有自动告警或人工处理接口。
+- Ticket 售罄状态不会随 Inventory 自动更新为 `SOLD_OUT`。
+- 电子票、通知、退款、分布式追踪和生产级 Secret 管理尚未实现。
+- 当前性能报告只覆盖直连 Inventory Service，不代表 Gateway 或完整订单链路性能。
 
-PAYMENT_API_KEY=
-PAYMENT_WEBHOOK_SECRET=
-MAIL_API_KEY=
-```
+## 10. 下一阶段开发顺序
 
-真实 `.env` 和任何密钥文件必须加入 `.gitignore`，不能上传到 GitHub。
+### Phase 1：完成支付闭环
 
-## 11. API 设计约定
+1. 完成 Payment Mapper、Service 和数据库读写。
+2. 创建支付时校验订单 ID、用户、金额和 `PENDING_PAYMENT` 状态。
+3. 只接受服务端验证过的支付回调，使用稳定 `eventId/paymentId/orderId` 幂等处理。
+4. Order 使用条件更新，只允许未过期的 `PENDING_PAYMENT -> PAID`。
+5. 明确定义“支付与过期同时发生”时的退款或人工复核策略。
 
-- API 统一使用 `/api/...` 前缀。
-- 请求和响应使用 JSON。
-- 时间使用 ISO 8601 UTC 格式，例如 `2026-09-16T10:30:00Z`。
-- 金额使用 `BigDecimal` 和明确的币种字段，不能使用 `float` 或 `double`。
-- 分页接口统一使用 `page`、`size` 和 `sort`。
-- 错误响应应包含稳定的错误码，不要让前端依赖异常文字判断。
+### Phase 2：收紧入口与安全边界
 
-建议错误格式：
+1. 将 Order 路由接入 Gateway。
+2. 为订单查询、取消和支付增加用户资源归属检查。
+3. 统一错误码、请求追踪 ID 和时间格式。
+4. 不再把直接端口调用作为客户端正式入口。
 
-```json
-{
-  "timestamp": "2026-09-16T10:30:00Z",
-  "status": 409,
-  "code": "SEAT_ALREADY_HELD",
-  "message": "The selected seat is no longer available.",
-  "path": "/api/inventory/holds",
-  "requestId": "9a61f5d8-4f7a-4cc5-84f4-1cfb16c927a8"
-}
-```
+### Phase 3：提高可靠性
 
-## 12. 测试策略
+1. 为关键数据库变更增加 Transactional Outbox。
+2. 增加 release task 对账、`DEAD` 告警和人工重放能力。
+3. 增加 Kafka DLQ、监控指标和端到端追踪。
+4. 做支付/取消/过期竞态测试和服务重启恢复测试。
 
-每个服务至少需要：
+### Phase 4：出票与通知
 
-- 单元测试：业务状态转换、金额计算和验证规则
-- Repository 测试：唯一约束、并发更新和数据库查询
-- API 集成测试：认证、参数校验和错误响应
-- Contract 测试：保证 Gateway、服务和事件格式兼容
-- 并发测试：多个请求同时购买同一座位时只能有一个成功
-- 端到端测试：浏览活动、锁座、下单、支付回调、出票和验票
+1. 支付成功后生成不可预测且可验证的电子票。
+2. 增加原子验票，防止重复核销。
+3. 异步发送 Email/SMS/应用内通知，通知失败不能回滚已支付订单。
 
-推荐使用 Testcontainers 启动真实的 PostgreSQL/MySQL、Redis 和消息队列测试环境，避免只使用与生产行为不同的内存数据库。
+## 11. 测试原则
 
-## 13. 推荐开发顺序
+- 构建成功不能替代真实运行验证。
+- 库存测试必须同时检查 HTTP、Redis、Inventory MySQL、Order MySQL 和 Kafka 消费结果。
+- JMeter 报告清空不会重置业务状态；重新压测前必须核对库存、预留 Key、订单和事件表。
+- 竞态测试必须验证条件更新实际影响一行，不能只检查最终 Java 对象。
+- 故障测试应验证中间状态（如 `RETRY`）和最终收敛状态（如 `SUCCESS`），不能只看服务恢复。
+- 所有重复事件和重复请求都必须使用相同幂等 ID 验证“副作用只发生一次”。
 
-### Phase 1：可运行的基础项目
+## 12. 文档维护规则
 
-- 配置 API Gateway 基础路由和 CORS
-- 创建 Identity、Event、Inventory 和 Order Service
-- 添加数据库、Redis 和 Docker Compose
-- 完成登录、活动查询、锁座及创建订单
-
-### Phase 2：完成交易闭环
-
-- 创建 Payment 和 Ticket Service
-- 接入支付 Sandbox
-- 实现支付 Webhook、确认库存和电子票生成
-- 创建 Notification Service
-
-### Phase 3：可靠性与高并发
-
-- 加入 Kafka 或 RabbitMQ
-- 实现 Outbox、Saga、失败重试和死信队列
-- 加入 Redis 限流、排队机制和热点活动缓存
-- 执行并发测试、负载测试和故障测试
-
-### Phase 4：部署与监控
-
-- 为每个服务创建 Dockerfile
-- 配置 CI 测试和构建流程
-- 加入集中日志、指标、告警和分布式追踪
-- 配置 Secret 管理、HTTPS、数据库备份和恢复方案
-
-## 14. 当前下一步
-
-建议先完成以下最小任务，不要立即创建所有服务的空项目：
-
-1. 为 Gateway 添加端口、路由、CORS 和统一安全配置。
-2. 创建 `identity-service`，完成注册、登录和 JWT。
-3. 创建 `event-service`，完成活动、场次和座位图查询。
-4. 创建 `inventory-service`，重点验证并发锁座不会重复售票。
-5. 创建 `order-service`，跑通“锁座 → 创建订单 → 超时释放”的 MVP 流程。
-
-完成以上流程后，再接入真实支付、消息队列、电子票和通知，可以减少早期服务过多但没有完整业务流程的问题。
+- README 只保留项目介绍、启动方式、API 概览和已经取得的验证结果。
+- DEVELOPMENT 记录实际调用链、边界、限制和下一步。
+- 未经过运行验证的能力必须明确写为 scaffold、planned 或 unverified。
+- 新的实测结论应同时记录日期、入口、关键状态以及 Redis/MySQL 最终值。
