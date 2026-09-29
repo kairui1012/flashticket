@@ -1,6 +1,7 @@
 package com.flashticket.paymentservice.controller;
 
 import com.flashticket.paymentservice.dto.CreatePaymentRequest;
+import com.flashticket.paymentservice.dto.CheckoutSessionResponse;
 import com.flashticket.paymentservice.dto.PaymentResponse;
 import com.flashticket.paymentservice.dto.UpdatePaymentRequest;
 import com.flashticket.paymentservice.service.PaymentService;
@@ -47,11 +48,14 @@ public class PaymentController {
         );
     }
 
-    @PostMapping("/{paymentId}/checkout")
-    public ResponseEntity<PaymentResponse> paymentCheckout(String paymentId){
-        return ResponseEntity.ok(
-                paymentService.paymentCheckout(paymentId);
-        );
+    // Creates a Stripe-hosted Checkout Session for a pending payment.
+    @PostMapping("/{paymentId}/checkout-session")
+    public ResponseEntity<CheckoutSessionResponse> createCheckoutSession(
+            @PathVariable String paymentId
+    ) {
+        return ResponseEntity
+                .status(HttpStatus.CREATED)
+                .body(paymentService.createCheckoutSession(paymentId));
     }
 
     // Updates the status and provider details of one payment.
