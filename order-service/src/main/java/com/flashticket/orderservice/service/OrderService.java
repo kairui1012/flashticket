@@ -1,9 +1,7 @@
 package com.flashticket.orderservice.service;
 
-import com.flashticket.orderservice.client.PaymentClient;
 import com.flashticket.orderservice.event.InventoryReservedEvent;
 import com.flashticket.orderservice.event.OrderCreatedEvent;
-import com.flashticket.orderservice.client.InventoryClient;
 import com.flashticket.orderservice.client.TicketClient;
 import com.flashticket.orderservice.dto.OrderResponse;
 import com.flashticket.orderservice.dto.TicketPriceResponse;
@@ -40,9 +38,6 @@ public class OrderService {
 
     private final InventoryReleaseTaskService inventoryReleaseTaskService;
     private final OrderOutboxService orderOutboxService;
-
-    private final PaymentClient paymentClient;
-    private final InventoryClient inventoryClient;
 
     private final OrderMapper orderMapper;
     private final TicketClient ticketClient;

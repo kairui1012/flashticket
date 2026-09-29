@@ -1,6 +1,5 @@
 package com.flashticket.paymentservice.service;
 
-import com.flashticket.paymentservice.config.StripeProperties;
 import com.flashticket.paymentservice.client.OrderClient;
 import com.flashticket.paymentservice.dto.CheckoutSessionResponse;
 import com.flashticket.paymentservice.dto.CreatePaymentRequest;
@@ -11,20 +10,22 @@ import com.flashticket.paymentservice.entity.OrderStatus;
 import com.flashticket.paymentservice.entity.Payment;
 import com.flashticket.paymentservice.entity.PaymentStatus;
 import com.flashticket.paymentservice.mapper.PaymentMapper;
+import com.stripe.StripeClient;
 import com.stripe.exception.StripeException;
 import com.stripe.model.checkout.Session;
-import com.stripe.net.RequestOptions;
-import com.stripe.param.checkout.SessionCreateParams;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
+import com.flashticket.paymentservice.config.StripeProperties;
+import com.stripe.param.checkout.SessionCreateParams;
 
+
+import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.LocalDateTime;
-import java.math.RoundingMode;
 import java.util.UUID;
 
 @Service
@@ -218,6 +219,9 @@ public class PaymentService {
 
     public CheckoutSessionResponse createCheckoutSession(String paymentId) {
         Payment payment = paymentMapper.findById(paymentId);
+        StripeClient client =
+                new StripeClient(stripeProperties.getSecretKey());
+
 
         if (payment == null) {
             throw new ResponseStatusException(
@@ -265,11 +269,11 @@ public class PaymentService {
             );
         }
 
-        if (stripeProperties.getSecretKey() == null
-                || stripeProperties.getSecretKey().isBlank()) {
+        if (payment.getAmount() == null
+                || payment.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
             throw new ResponseStatusException(
-                    HttpStatus.SERVICE_UNAVAILABLE,
-                    "Stripe is not configured"
+                    HttpStatus.CONFLICT,
+                    "Payment amount must be greater than zero"
             );
         }
 
@@ -278,55 +282,50 @@ public class PaymentService {
         try {
             amountInMinorUnits = payment.getAmount()
                     .movePointRight(2)
-                    .setScale(0, RoundingMode.UNNECESSARY)
                     .longValueExact();
         } catch (ArithmeticException exception) {
             throw new ResponseStatusException(
                     HttpStatus.INTERNAL_SERVER_ERROR,
-                    "Payment amount cannot be converted to Stripe minor units",
+                    "Payment amount cannot be converted to minor units",
                     exception
             );
         }
 
-        SessionCreateParams params = SessionCreateParams.builder()
-                .setMode(SessionCreateParams.Mode.PAYMENT)
-                .setSuccessUrl(stripeProperties.getSuccessUrl())
-                .setCancelUrl(stripeProperties.getCancelUrl())
-                .setClientReferenceId(payment.getId())
-                .putMetadata("paymentId", payment.getId())
-                .putMetadata("orderId", payment.getOrderId())
-                .addLineItem(
-                        SessionCreateParams.LineItem.builder()
-                                .setQuantity(1L)
-                                .setPriceData(
-                                        SessionCreateParams.LineItem.PriceData.builder()
-                                                .setCurrency(stripeProperties.getCurrency())
-                                                .setUnitAmount(amountInMinorUnits)
-                                                .setProductData(
-                                                        SessionCreateParams.LineItem.PriceData.ProductData.builder()
-                                                                .setName("FlashTicket order " + payment.getOrderId())
-                                                                .build()
-                                                )
-                                                .build()
-                                )
-                                .build()
-                )
-                .build();
+        SessionCreateParams.LineItem.PriceData.ProductData productData =
+                SessionCreateParams.LineItem.PriceData.ProductData.builder()
+                        .setName("FlashTicket order " + payment.getOrderId())
+                        .setDescription("amount:" + payment.getAmount())
+                        .build();
 
-        RequestOptions requestOptions = RequestOptions.builder()
-                .setApiKey(stripeProperties.getSecretKey())
-                .setIdempotencyKey("checkout-session:" + payment.getId())
-                .build();
+        SessionCreateParams.LineItem.PriceData priceData =
+                SessionCreateParams.LineItem.PriceData.builder()
+                        .setCurrency(stripeProperties.getCurrency())
+                        .setUnitAmount(amountInMinorUnits)
+                        .setProductData(productData)
+                        .build();
+
+        SessionCreateParams.LineItem lineItem =
+                SessionCreateParams.LineItem.builder()
+                        .setQuantity(1L)
+                        .setPriceData(priceData)
+                        .build();
+
+        SessionCreateParams params =
+                SessionCreateParams.builder()
+                        .setMode(SessionCreateParams.Mode.PAYMENT)
+                        .setSuccessUrl(stripeProperties.getSuccessUrl())
+                        .setCancelUrl(stripeProperties.getCancelUrl())
+                        .setClientReferenceId(payment.getId())
+                        .putMetadata("paymentId", payment.getId())
+                        .putMetadata("orderId", payment.getOrderId())
+                        .addLineItem(lineItem)
+                        .build();
 
         try {
-            Session session = Session.create(params, requestOptions);
-
-            if (session.getUrl() == null || session.getUrl().isBlank()) {
-                throw new ResponseStatusException(
-                        HttpStatus.BAD_GATEWAY,
-                        "Stripe did not return a checkout URL"
-                );
-            }
+            Session session = client.v1()
+                    .checkout()
+                    .sessions()
+                    .create(params);
 
             return new CheckoutSessionResponse(
                     payment.getId(),
@@ -337,7 +336,7 @@ public class PaymentService {
         } catch (StripeException exception) {
             throw new ResponseStatusException(
                     HttpStatus.BAD_GATEWAY,
-                    "Unable to create the Stripe checkout session",
+                    "Unable to create Stripe Checkout Session",
                     exception
             );
         }
