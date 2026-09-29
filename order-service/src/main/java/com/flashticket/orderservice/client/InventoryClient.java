@@ -13,4 +13,5 @@ public interface InventoryClient {
 
     @PostMapping("/api/v1/inventory/release")
     void releaseStock(@RequestBody ReleaseInventoryRequest request);
+    
 }

@@ -22,6 +22,7 @@ spring:
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
@@ -31,6 +32,23 @@ spring:
         enable.idempotence: true
         max.in.flight.requests.per.connection: 5
         spring.json.add.type.headers: true
+
+    consumer:
+      group-id: payment-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+      properties:
+        spring.json.trusted.packages: com.flashticket.paymentservice.event
+        spring.json.use.type.headers: false
+        spring.json.value.default.type: com.flashticket.paymentservice.event.OrderCreatedEvent
+
+    listener:
+      ack-mode: record
+
+order-service:
+  base-url: ${ORDER_SERVICE_BASE_URL:http://localhost:8084}
 
 management:
   endpoints:
@@ -44,3 +62,8 @@ logging:
   level:
     root: WARN
     com.flashticket.paymentservice: INFO
+
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    map-underscore-to-camel-case: true

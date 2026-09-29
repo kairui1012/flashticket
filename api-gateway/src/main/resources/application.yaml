@@ -30,6 +30,20 @@ spring:
                 - Path=/api/v1/inventory/**
               filters:
                 - name: SoldOut
+            - id: order-service
+              uri: ${ORDER_SERVICE_URL:http://localhost:8084}
+              predicates:
+                - Path=/api/v1/orders/**
+            - id: payment-service
+              uri: ${PAYMENT_SERVICE_URL:http://localhost:8085}
+              predicates:
+                - Path=/api/v1/payments/**
+              filters:
+                - name: RequestRateLimiter
+                  args:
+                    key-resolver: "#{@userKeyResolver}"
+                    redis-rate-limiter.replenishRate: 5
+                    redis-rate-limiter.burstCapacity: 10
 
 
 

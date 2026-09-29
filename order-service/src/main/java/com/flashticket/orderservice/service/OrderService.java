@@ -2,6 +2,7 @@ package com.flashticket.orderservice.service;
 
 import com.flashticket.orderservice.client.PaymentClient;
 import com.flashticket.orderservice.event.InventoryReservedEvent;
+import com.flashticket.orderservice.event.OrderCreatedEvent;
 import com.flashticket.orderservice.client.InventoryClient;
 import com.flashticket.orderservice.client.TicketClient;
 import com.flashticket.orderservice.dto.OrderResponse;
@@ -13,7 +14,6 @@ import feign.FeignException;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.http.HttpStatus;
-import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
@@ -35,11 +35,11 @@ public class OrderService {
     private static final Duration ORDER_CACHE_TTL = Duration.ofMinutes(5);
     private static final OrderStatus USER_CANCELLED = CANCELLED;
 
-    private final KafkaTemplate<String,Order> kafkaTemplate;
     private final RedisTemplate<String, OrderResponse> redisTemplate;
     private final RedisTemplate<String, List<OrderResponse>> redisTemplateForOrderList;
 
     private final InventoryReleaseTaskService inventoryReleaseTaskService;
+    private final OrderOutboxService orderOutboxService;
 
     private final PaymentClient paymentClient;
     private final InventoryClient inventoryClient;
@@ -49,6 +49,7 @@ public class OrderService {
 
 
     // Creates a pending-payment order after inventory has been reserved successfully.
+    @Transactional
     public void createOrderFromInventoryEvent(InventoryReservedEvent event) {
         TicketPriceResponse ticket;
 
@@ -107,6 +108,19 @@ public class OrderService {
         redisTemplateForOrderList.delete(
                 userOrdersKey(order.getUserId())
         );
+
+        OrderCreatedEvent orderCreatedEvent = new OrderCreatedEvent(
+                UUID.randomUUID().toString(),
+                order.getId(),
+                order.getUserId(),
+                order.getTotalAmount(),
+                order.getExpiresAt(),
+                LocalDateTime.now()
+        );
+
+        // Store the event in the same transaction as the order.
+        // OrderOutboxWorker publishes it to Kafka and retries failures safely.
+        orderOutboxService.createOrderCreatedEvent(orderCreatedEvent);
     }
 
     // Returns an order from Redis when available, otherwise loads it from MySQL.

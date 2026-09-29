@@ -71,6 +71,9 @@ order:
   expiration:
     scan-delay-ms: ${ORDER_EXPIRATION_SCAN_DELAY_MS:5000}
     initial-delay-ms: ${ORDER_EXPIRATION_INITIAL_DELAY_MS:15000}
+  outbox:
+    worker-delay-ms: ${ORDER_OUTBOX_WORKER_DELAY_MS:5000}
+    worker-initial-delay-ms: ${ORDER_OUTBOX_WORKER_INITIAL_DELAY_MS:5000}
 
 inventory:
   release:

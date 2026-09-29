@@ -47,6 +47,13 @@ public class PaymentController {
         );
     }
 
+    @PostMapping("/{paymentId}/checkout")
+    public ResponseEntity<PaymentResponse> paymentCheckout(String paymentId){
+        return ResponseEntity.ok(
+                paymentService.paymentCheckout(paymentId);
+        );
+    }
+
     // Updates the status and provider details of one payment.
     @PatchMapping("/{paymentId}")
     public ResponseEntity<PaymentResponse> updatePayment(

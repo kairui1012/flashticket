@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.flashticket.orderservice.mapper.OrderOutboxEventMapper">
+
+    <resultMap id="OrderOutboxEventResultMap"
+               type="com.flashticket.orderservice.entity.OrderOutboxEvent">
+        <id property="id" column="id"/>
+        <result property="aggregateId" column="aggregate_id"/>
+        <result property="topic" column="topic"/>
+        <result property="eventType" column="event_type"/>
+        <result property="payload" column="payload"/>
+        <result property="status" column="status"/>
+        <result property="retryCount" column="retry_count"/>
+        <result property="nextRetryAt" column="next_retry_at"/>
+        <result property="lockedAt" column="locked_at"/>
+        <result property="lastError" column="last_error"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <sql id="OrderOutboxEventColumns">
+        id,
+        aggregate_id,
+        topic,
+        event_type,
+        payload,
+        status,
+        retry_count,
+        next_retry_at,
+        locked_at,
+        last_error,
+        created_at,
+        updated_at
+    </sql>
+
+    <insert id="insertIfAbsent">
+        INSERT IGNORE INTO order_outbox_events (
+            id,
+            aggregate_id,
+            topic,
+            event_type,
+            payload,
+            status,
+            retry_count,
+            next_retry_at,
+            locked_at,
+            last_error,
+            created_at,
+            updated_at
+        ) VALUES (
+            #{id},
+            #{aggregateId},
+            #{topic},
+            #{eventType},
+            #{payload},
+            #{status},
+            #{retryCount},
+            #{nextRetryAt},
+            #{lockedAt},
+            #{lastError},
+            #{createdAt},
+            #{updatedAt}
+        )
+    </insert>
+
+    <select id="findReadyEvents" resultMap="OrderOutboxEventResultMap">
+        SELECT
+            <include refid="OrderOutboxEventColumns"/>
+        FROM order_outbox_events
+        WHERE (
+                status IN ('PENDING', 'RETRY')
+                AND next_retry_at &lt;= #{now}
+              )
+           OR (
+                status = 'PROCESSING'
+                AND locked_at &lt;= #{lockExpiredBefore}
+              )
+        ORDER BY next_retry_at ASC
+        LIMIT #{limit}
+    </select>
+
+    <update id="markProcessing">
+        UPDATE order_outbox_events
+        SET status = 'PROCESSING',
+            locked_at = #{now},
+            updated_at = #{now}
+        WHERE id = #{eventId}
+          AND (
+                (status IN ('PENDING', 'RETRY') AND next_retry_at &lt;= #{now})
+                OR (status = 'PROCESSING' AND locked_at &lt;= #{lockExpiredBefore})
+              )
+    </update>
+
+    <update id="markPublished">
+        UPDATE order_outbox_events
+        SET status = 'PUBLISHED',
+            locked_at = NULL,
+            last_error = NULL,
+            updated_at = #{updatedAt}
+        WHERE id = #{eventId}
+          AND status = 'PROCESSING'
+    </update>
+
+    <update id="markRetry">
+        UPDATE order_outbox_events
+        SET status = 'RETRY',
+            retry_count = #{retryCount},
+            next_retry_at = #{nextRetryAt},
+            locked_at = NULL,
+            last_error = #{lastError},
+            updated_at = #{updatedAt}
+        WHERE id = #{eventId}
+          AND status = 'PROCESSING'
+    </update>
+
+    <update id="markDead">
+        UPDATE order_outbox_events
+        SET status = 'DEAD',
+            retry_count = #{retryCount},
+            locked_at = NULL,
+            last_error = #{lastError},
+            updated_at = #{updatedAt}
+        WHERE id = #{eventId}
+          AND status = 'PROCESSING'
+    </update>
+
+</mapper>

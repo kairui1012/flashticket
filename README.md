@@ -1,32 +1,25 @@
 # FlashTicket
 
-FlashTicket is a work-in-progress microservices backend for high-concurrency ticket sales. It combines JWT-based access control, Redis Lua scripts for atomic stock reservation, Kafka events for asynchronous inventory and order processing, MySQL, and an API Gateway.👍
+FlashTicket 是一个面向高并发抢票场景的微服务后端项目。系统通过 Redis Lua 原子预留库存，使用 Kafka 异步同步 MySQL、创建订单并触发支付记录，同时通过可重试任务处理取消和超时后的库存释放。
+
+> 当前项目适合本地开发与架构演示，尚未完成真实支付渠道、生产级运维和全部跨服务一致性能力。
+FlashTicket is a work-in-progress microservices backend for high-concurrency ticket sales. It combines JWT-based access control, Redis Lua scripts for atomic stock reservation, Kafka events for asynchronous inventory and order processing, MySQL, and an API Gateway.
 
 FlashTicket 是一个面向高并发抢票场景的微服务后端项目。系统使用 JWT 进行权限控制，通过 Redis Lua 脚本原子预留库存，并使用 Kafka 异步同步库存及创建订单。目前 Auth、Ticket 与 Inventory 已接入 API Gateway，Order 仍通过 `8084` 直接访问。
 
-## Features / 已实现功能
+## 核心能力
 
-- Registration and login with BCrypt password hashing
-- RSA-signed JWT tokens with `USER` and `ADMIN` roles
-- Gateway routing, authorization, and Redis-backed rate limiting
-- Ticket creation, lookup, update, cancellation, and Redis caching
-- Inventory creation, lookup, and manual stock adjustment
-- Atomic reservation and release through Redis Lua scripts
-- Per-user reservation keys with a 15-minute safety TTL
-- Kafka-based `inventory.reserved` and `inventory.release` processing
-- Idempotent MySQL synchronization through processed-event records
-- Kafka-driven `PENDING_PAYMENT` order creation and five-minute expiration
-- Durable inventory-release tasks with retry and idempotent release IDs
-- Flyway database migrations for Auth, Ticket, Inventory, Order, and Payment schemas
-- Docker Compose infrastructure for MySQL, Redis, Kafka, and ZooKeeper
+- BCrypt 密码加密、RSA JWT 认证与 `USER` / `ADMIN` 权限控制
+- API Gateway 路由、鉴权与基于 Redis 的限流
+- Ticket 管理及 Redis 缓存
+- Redis Lua 原子库存预留与释放
+- Kafka 驱动的库存同步、订单创建和支付记录创建
+- MySQL 消费幂等与相同 `releaseId` 的重复释放保护
+- 五分钟未付款订单过期
+- 持久化库存释放任务、失败重试与最终恢复
+- Order Outbox 可靠发布 `order.created`
 
-已实现用户注册登录、JWT 权限控制、票种管理、Redis 原子库存预留与释放、Kafka 幂等同步、待支付订单创建、五分钟过期、取消订单及可重试库存释放。
-
-> `order-service` now supports Kafka-driven order creation, queries, cancellation, payment marking, five-minute expiration, and retryable inventory release. Gateway routing and the complete payment workflow remain under development.
->
-> `order-service` 目前已支持 Kafka 驱动的订单创建、查询、取消、支付标记、五分钟过期及库存释放重试；Gateway 路由与完整支付流程仍在开发中。
-
-## Architecture / 架构
+## 架构
 
 ```text
 Client
@@ -35,323 +28,186 @@ Client
 API Gateway :8080
   |-- Auth Service :8081 ------> MySQL
   |-- Ticket Service :8082 ----> MySQL + Redis
-  `-- Inventory Service :8083 -> Redis Lua -> Kafka -> MySQL
-                                      |          |
-                                      |          `-> Inventory consumer
-                                      `------------> Order Service :8084 -> MySQL + Redis
+  `-- Inventory Service :8083
+          |-- Redis Lua: reserve / release
+          `-- inventory.reserved --> Kafka
+                    |-- Inventory Consumer --> MySQL inventory
+                    `-- Order Consumer ------> Order Service :8084
+                                                  |-- orders
+                                                  `-- order_outbox_events (PENDING)
+                                                          |
+                                                   Outbox Worker
+                                                          |
+                                                   order.created --> Kafka
+                                                          |
+                                                   Payment Consumer
+                                                          |
+                                                   Payment Service :8085
+                                                          |-- MySQL payments
+                                                          `-- Redis payment cache
 
-Payment Service :8085 (scaffold only; endpoints currently return 501)
+Order cancel / five-minute expiry
+  --> inventory_release_tasks
+  --> Inventory release API
+  --> Redis + MySQL stock recovery
 ```
 
-Reservation flow / 库存预留流程：
+## 服务
 
-1. Inventory Service validates the ticket and sale window through Ticket Service.
-2. A Redis Lua script checks the user's reservation and decrements stock atomically.
-3. The service submits an `inventory.reserved` event to Kafka.
-4. The Inventory consumer updates MySQL idempotently.
-5. The Order consumer creates a five-minute `PENDING_PAYMENT` order from the same event.
+| 服务 | 端口 | 当前职责 |
+| --- | ---: | --- |
+| API Gateway | 8080 | Auth、Ticket、Inventory、Order、Payment 路由，JWT 鉴权与限流 |
+| Auth Service | 8081 | 注册、登录、JWT 签发 |
+| Ticket Service | 8082 | 票种 CRUD、销售状态与缓存 |
+| Inventory Service | 8083 | 库存管理、预留、释放及 Kafka 同步 |
+| Order Service | 8084 | 创建、查询、取消、标记支付、过期及 Outbox 发布 |
+| Payment Service | 8085 | 消费 `order.created`，创建和查询 `PENDING` 支付记录 |
 
-Inventory Service 会先验证票种及销售时间，再通过 Redis Lua 原子扣减库存并发布 Kafka 事件；Inventory Consumer 幂等更新 MySQL，Order Consumer 根据同一事件创建五分钟待支付订单。
+Gateway 已配置五个业务服务的 `/api/v1/**` 路由；各服务端口仍可用于本地诊断。
 
-## Tech stack / 技术栈
+## 核心流程
 
-| Area | Technology |
+### 预留、订单与支付记录
+
+1. Inventory Service 向 Ticket Service 校验票种和销售时间。
+2. Redis Lua 原子检查重复预留并扣减 `availableStock`。
+3. 发布 `inventory.reserved`。
+4. Inventory Consumer 幂等增加 MySQL `reserved_stock`。
+5. Order Consumer 创建五分钟有效的 `PENDING_PAYMENT` Order，并在同一事务写入 `PENDING` Outbox。
+6. Outbox Worker 发布 `order.created`，成功后将 Outbox 标记为 `PUBLISHED`。
+7. PaymentConsumer 消费事件，创建一条 `PENDING` payment，并写入 Redis 缓存。
+
+### 取消或超时释放
+
+1. 用户取消，或调度器依据 `orders.expires_at` 将五分钟未支付订单标记为 `EXPIRED`。
+2. Order Service 创建持久化的 `inventory_release_tasks`。
+3. Worker 使用固定 `releaseId` 请求 Inventory Service 释放库存。
+4. Inventory Service 通过 Lua 和事件幂等保护，确保重复请求不会重复增加库存。
+5. 暂时失败的任务进入 `RETRY`；服务恢复后重试至 `SUCCESS`。
+
+Redis reservation key 的 15 分钟 TTL 只是安全缓冲，订单的五分钟 `expires_at` 才是业务过期依据。
+
+## 技术栈
+
+| 范围 | 技术 |
 | --- | --- |
-| Language | Java 21 |
-| Framework | Spring Boot 4.1.1 |
-| Gateway | Spring Cloud Gateway |
-| Security | Spring Security, OAuth2 Resource Server, JWT |
-| Persistence | MySQL 8, MyBatis, Flyway |
-| Cache and concurrency | Redis, Lua |
+| Runtime | Java 21, Spring Boot 4.1.1 |
+| Security | Spring Security, OAuth2 Resource Server, RSA JWT |
+| Data | MySQL 8, MyBatis, Flyway |
+| Cache / concurrency | Redis, Lua |
 | Messaging | Kafka, ZooKeeper |
-| Load testing | Apache JMeter 5.6.3 |
-| Build and infrastructure | Maven Wrapper, Docker Compose |
+| Build / infrastructure | Maven Wrapper, Docker Compose |
+| Load test | Apache JMeter 5.6.3 |
 
-## Repository structure / 项目结构
+## 本地运行
 
-```text
-FlashTicket/
-├── api-gateway/        # Routing, JWT authorization, and rate limiting
-├── auth-service/       # Registration, login, and JWT generation
-├── ticket-service/     # Ticket management and Redis caching
-├── inventory-service/  # Atomic inventory reservation and Kafka synchronization
-├── order-service/      # Order lifecycle and retryable inventory release
-├── payment-service/    # Payment API/schema scaffold; business methods return 501
-├── docker/mysql/init/  # Local service-database initialization
-├── jmeter/             # JMeter data and result screenshots
-├── keys/               # Local RSA keys
-├── docker-compose.yml
-└── DEVELOPMENT.md
-```
-
-## Local ports / 本地端口
-
-| Component | Port |
-| --- | ---: |
-| API Gateway | `8080` |
-| Auth Service | `8081` |
-| Ticket Service | `8082` |
-| Inventory Service | `8083` |
-| Order Service | `8084` |
-| Payment Service | `8085` |
-| MySQL | `3307` |
-| Redis | `6379` |
-| Kafka | `9092` |
-
-## Local setup / 本地运行
-
-Requirements: Java 21, Docker, Docker Compose, and OpenSSL when RSA keys need to be generated.
-
-环境要求：Java 21、Docker、Docker Compose；需要重新生成 RSA 密钥时还需安装 OpenSSL。
-
-### 1. Start infrastructure / 启动基础设施
+前置条件：Java 21、Docker、Docker Compose。
 
 ```bash
 docker compose up -d
-docker compose ps
 ```
 
-On a new MySQL volume, the initialization script creates separate Auth, Ticket, Inventory, Order, and Payment databases. For an existing volume, create any missing databases manually:
-
-新的 MySQL Volume 会自动创建 Auth、Ticket、Inventory、Order 与 Payment 数据库。旧 Volume 若缺少数据库，可手动执行：
-
-```bash
-docker exec flashticket-mysql mysql -uroot -proot -e \
-  "CREATE DATABASE IF NOT EXISTS flashticket_auths;
-   CREATE DATABASE IF NOT EXISTS flashticket_ticket;
-   CREATE DATABASE IF NOT EXISTS flashticket_inventory;
-   CREATE DATABASE IF NOT EXISTS flashticket_order;
-   CREATE DATABASE IF NOT EXISTS flashticket_payment;"
-```
-
-### 2. Prepare local RSA keys / 准备本地 RSA 密钥
+首次运行 Auth Service 前生成 RSA 密钥：
 
 ```bash
 mkdir -p keys
-openssl genpkey -algorithm RSA -out keys/private.pem -pkeyopt rsa_keygen_bits:2048
-openssl rsa -pubout -in keys/private.pem -out keys/public.pem
+openssl genpkey -algorithm RSA \
+  -out keys/private.pem \
+  -pkeyopt rsa_keygen_bits:2048
+openssl rsa \
+  -pubout \
+  -in keys/private.pem \
+  -out keys/public.pem
 ```
 
-Never commit `keys/private.pem` or reuse local credentials in production.
-
-不要提交 `keys/private.pem`，也不要在生产环境使用本地示例密钥或密码。
-
-### 3. Start the services / 启动服务
-
-Run each command in a separate terminal from the repository root:
+分别在独立终端启动服务：
 
 ```bash
-cd auth-service
-./mvnw spring-boot:run
+cd auth-service && JWT_PRIVATE_KEY=file:../keys/private.pem JWT_PUBLIC_KEY=file:../keys/public.pem ./mvnw spring-boot:run
+cd ticket-service && ./mvnw spring-boot:run
+cd inventory-service && ./mvnw spring-boot:run
+cd order-service && ./mvnw spring-boot:run
+cd payment-service && ./mvnw spring-boot:run
+cd api-gateway && ./mvnw spring-boot:run
 ```
 
-```bash
-cd ticket-service
-./mvnw spring-boot:run
-```
-
-```bash
-cd inventory-service
-./mvnw spring-boot:run
-```
-
-```bash
-cd order-service
-./mvnw spring-boot:run
-```
-
-```bash
-cd api-gateway
-./mvnw spring-boot:run
-```
-
-Ticket, Inventory, and Order expose direct health checks. Auth and Gateway currently protect non-API paths through their security configuration.
-
-Ticket、Inventory 与 Order 提供直接健康检查；Auth 与 Gateway 当前会通过安全配置保护非 API 路径。
+检查主要业务服务：
 
 ```bash
 curl http://localhost:8082/actuator/health
 curl http://localhost:8083/actuator/health
 curl http://localhost:8084/actuator/health
+curl http://localhost:8085/actuator/health
 ```
 
-## API overview / API 概览
+## 主要 API
 
-Auth endpoints are public. Other supported routes should normally be accessed through `http://localhost:8080` with a JWT.
-
-认证接口允许公开访问。其他已接入接口通常应通过 `http://localhost:8080` 并携带 JWT 调用。
-
-| Service | Method and path | Gateway access |
+| 方法 | 地址 | 用途 |
 | --- | --- | --- |
-| Auth | `POST /api/v1/auth/register` | Public |
-| Auth | `POST /api/v1/auth/login` | Public |
-| Ticket | `GET /api/v1/tickets/{id}` | `USER`, `ADMIN` |
-| Ticket | `GET /api/v1/tickets/event/{eventId}` | `USER`, `ADMIN` |
-| Ticket | `POST /api/v1/tickets` | `ADMIN` |
-| Ticket | `PUT /api/v1/tickets/{id}` | `ADMIN` |
-| Ticket | `PATCH /api/v1/tickets/{id}/status/cancel` | `ADMIN` |
-| Inventory | `GET /api/v1/inventory/{ticketId}` | `USER`, `ADMIN` |
-| Inventory | Inventory write endpoints | `ADMIN` |
-| Order | `GET /api/v1/orders/{orderId}` | Direct `8084` only |
-| Order | `GET /api/v1/orders/user/{userId}` | Direct `8084` only |
-| Order | `POST /api/v1/orders/{orderId}/cancel` | Direct `8084` only |
-| Order | `POST /api/v1/orders/{orderId}/paid` | Direct `8084` only; local status transition |
-| Payment | `/api/v1/payments/**` | Direct `8085` scaffold; currently `501` |
+| POST | `http://localhost:8080/api/v1/auth/register` | 注册 |
+| POST | `http://localhost:8080/api/v1/auth/login` | 登录 |
+| GET / POST | `http://localhost:8080/api/v1/tickets` | 查询 / 创建票种 |
+| POST | `http://localhost:8080/api/v1/inventory/{ticketId}/reserve` | 预留库存 |
+| POST | `http://localhost:8080/api/v1/inventory/release` | 幂等释放库存 |
+| GET | `http://localhost:8080/api/v1/orders/{orderId}` | 查询订单 |
+| POST | `http://localhost:8080/api/v1/orders/{orderId}/cancel` | 取消订单 |
+| POST | `http://localhost:8080/api/v1/orders/{orderId}/paid` | 标记订单已支付 |
+| POST | `http://localhost:8080/api/v1/payments` | 手动创建支付记录 |
+| GET | `http://localhost:8080/api/v1/payments/{paymentId}` | 查询支付记录 |
 
-### Authentication / 身份认证
+正常业务流中 payment 由 `order.created` 自动触发，无需手动调用创建接口。
 
-```bash
-curl -X POST http://localhost:8080/api/v1/auth/register \
-  -H 'Content-Type: application/json' \
-  -d '{"email":"user@example.com","password":"change-me"}'
-```
+## 实机验证
 
-```bash
-curl -X POST http://localhost:8080/api/v1/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"email":"user@example.com","password":"change-me"}'
-```
+以下结果来自真实启动的 MySQL、Redis、Kafka 和微服务，不是单元测试或模拟结果。
 
-New accounts receive the `USER` role. After changing a local account to `ADMIN`, log in again to obtain a token containing the updated role.
+### 库存释放链路（2026-09-27）
 
-新账号默认为 `USER`。在本地数据库修改为 `ADMIN` 后，需要重新登录取得包含新角色的 Token。
-
-### Create a ticket and inventory / 创建票种与库存
-
-```bash
-curl -X POST http://localhost:8080/api/v1/tickets \
-  -H 'Authorization: Bearer <ADMIN_JWT>' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "eventId":"event-001",
-    "name":"Early Bird",
-    "description":"Limited allocation",
-    "price":49.90,
-    "totalStock":1000,
-    "saleStartTime":"2027-01-01T10:00:00",
-    "saleEndTime":"2027-01-31T23:59:59"
-  }'
-```
-
-Use the returned Ticket ID to initialize inventory:
-
-```bash
-curl -X POST http://localhost:8080/api/v1/inventory/insert \
-  -H 'Authorization: Bearer <ADMIN_JWT>' \
-  -H 'Content-Type: application/json' \
-  -d '{"ticketId":"<TICKET_ID>","totalStock":1000}'
-```
-
-### Reserve and release / 预留与释放
-
-```bash
-curl -X POST http://localhost:8080/api/v1/inventory/<TICKET_ID>/reserve \
-  -H 'Authorization: Bearer <ADMIN_JWT>' \
-  -H 'Content-Type: application/json' \
-  -d '{"ticketId":"<TICKET_ID>","userId":"<USER_ID>","reservedStock":1}'
-```
-
-```bash
-curl -X POST http://localhost:8080/api/v1/inventory/release \
-  -H 'Authorization: Bearer <ADMIN_JWT>' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "ticketId":"<TICKET_ID>",
-    "userId":"<USER_ID>",
-    "reservedStock":1,
-    "releaseId":"<STABLE_RELEASE_ID>",
-    "orderId":"<ORDER_ID>"
-  }'
-```
-
-## Redis and Kafka / Redis 与 Kafka
-
-| Key or topic | Purpose |
+| 场景 | 验证结果 |
 | --- | --- |
-| `ticket:{ticketId}` | Ticket cache, 10-minute TTL |
-| `tickets:event:{eventId}` | Ticket list cache |
-| `ticket:not-found:{ticketId}` | Ticket negative cache |
-| `inventory:{ticketId}` | Inventory detail cache |
-| `inventory:not-found:{ticketId}` | Inventory negative cache, 30-second TTL |
-| `inventory:stock:{ticketId}` | Atomic available-stock counter |
-| `inventory:reserved:{ticketId}:{userId}` | Per-user reservation, 15-minute safety TTL |
-| `inventory:release:{releaseId}` | Idempotent release result, seven-day TTL |
-| `order:{orderId}` | Order detail cache, five-minute TTL |
-| `orders:user:{userId}` | User order-list cache, five-minute TTL |
-| `inventory.reserved` | Successful reservation event |
-| `inventory.release` | Reservation release event |
+| 正常预留 | Redis `availableStock` 减少，reservation key 存在，MySQL `reserved_stock` 增加，Order 为 `PENDING_PAYMENT` |
+| 用户取消 | Order 为 `CANCELLED`，release task 为 `SUCCESS`，Redis / MySQL 库存恢复 |
+| 五分钟未付款 | Order 在 `expires_at` 后变成 `EXPIRED`，release task 为 `SUCCESS`，库存恢复 |
+| 重复释放 | 相同 `releaseId` 请求两次均安全返回，Redis 只增加一次，MySQL 只释放一次 |
+| Inventory 暂时不可用 | release task 先进入 `RETRY`，Inventory 恢复后变成 `SUCCESS`，库存最终恢复为 `available=10, reserved=0` |
 
-Redis is the concurrency boundary for reservation and release. Kafka consumers synchronize successful changes to MySQL and use `processed_events` for event idempotency.
+### Order Outbox 与 Payment（2026-09-29）
 
-Redis 是库存并发控制边界；Kafka Consumer 将成功变更同步至 MySQL，并通过 `processed_events` 保证事件幂等。
-
-## Order and inventory runtime validation / 订单与库存实机验证
-
-The reservation, cancellation, expiration, idempotent release, and retry paths were validated against the running services on 2026-09-27. The checks used real HTTP requests, Redis, Kafka, and MySQL; they were not mocked or limited to unit tests.
-
-以下预留、取消、过期、幂等释放及故障重试流程已于 2026-09-27 通过真实 HTTP、Redis、Kafka 与 MySQL 实机验证，并非 Mock 或仅执行单元测试。
-
-| Scenario / 场景 | Observed result / 实测结果 |
+| 检查点 | 实际结果 |
 | --- | --- |
-| Normal reservation / 正常预留 | Inventory HTTP returned `200`; Redis available stock changed `10 -> 8`, the reservation key stored `2`, MySQL changed from `10/0` to `8/2` available/reserved, and Order created a `PENDING_PAYMENT` record. |
-| User cancellation / 用户取消 | A quantity-3 reservation changed inventory to `7/3`; cancelling the order returned `200`, changed Order to `CANCELLED`, completed the release task as `SUCCESS` with `retry_count=0`, deleted the Redis reservation key, and restored Redis/MySQL to `10/0`. |
-| Five-minute expiration / 五分钟未付款 | Order `900682f3-d5d1-4c33-b46c-f364ee9d2e35` was created at `15:14:37` with `expires_at=15:19:37`; it remained pending before the deadline and was observed as `EXPIRED` with a `SUCCESS` release task at `15:19:40`. Redis/MySQL were restored from `8/2` to `10/0`. |
-| Duplicate release / 重复释放 | Two release requests with the same `releaseId` both returned `200`. The first restored inventory from `6/4` to `10/0`; the second left it at `10/0`. MySQL stored one processed release event, so stock was released only once. |
-| Inventory outage and retry / Inventory 暂时不可用 | With Inventory Service stopped, the release task entered `RETRY` with `retry_count=1` and a connection-refused error while inventory remained `8/2`. After Inventory Service recovered, the same task became `SUCCESS`, cleared the error, and restored Redis/MySQL to `10/0`. |
+| 库存预留 | HTTP 200；库存由 `10/0` 变为 `8/2` |
+| Order | 创建为 `PENDING_PAYMENT`，金额 `70.00` |
+| Outbox | `PENDING -> PROCESSING -> PUBLISHED`，`retry_count=0` |
+| Kafka | `order.created` 包含相同 order、user、amount 和 expiresAt；consumer lag 为 0 |
+| Payment | `payments` 表生成一条 `PENDING` 记录，金额 `70.00` |
+| Redis | `payment:{paymentId}` 与 `payment:order:{orderId}` 均出现，TTL 为 300 秒 |
 
-## Load-test result / 压测结果
+五分钟后 Redis payment 缓存按 TTL 到期，Order 正常变成 `EXPIRED`。当前 Payment 记录仍保持 `PENDING`，这是尚待补齐的跨服务状态同步。
 
-The latest recorded benchmark used Apache JMeter 5.6.3 with `10,000` unique users competing for `1,000` tickets. The JMeter Thread Group was configured with `200` threads, a `5`-second ramp-up period, and `50` loops (`200 / 5 / 50`), producing `10,000` total requests. Test users are stored in [`jmeter/users-10000.csv`](./jmeter/users-10000.csv).
+## 并发压测
 
-最新记录使用 Apache JMeter 5.6.3，让 `10,000` 个不同用户抢 `1,000` 张票。JMeter Thread Group 配置为 `200` 个线程、`5` 秒 Ramp-up、循环 `50` 次（`200 / 5 / 50`），共发出 `10,000` 个请求。测试用户位于 [`jmeter/users-10000.csv`](./jmeter/users-10000.csv)。
+JMeter 直接请求 Inventory Service 的库存预留接口：200 threads、5 秒 ramp-up、每线程 50 次，共 10,000 次请求；初始库存为 1,000。
 
-| Metric / 指标 | Result / 结果 |
+| 指标 | 结果 |
 | --- | ---: |
-| Total requests / 总请求数 | `10,000` |
-| Average response / 平均响应 | `16 ms` |
-| Minimum / 最小响应 | `0 ms` |
-| Maximum / 最大响应 | `609 ms` |
-| Standard deviation / 标准差 | `23.739711832918275 ms` |
-| JMeter error rate | `90.00%` (`0.9`) |
-| Throughput / 吞吐量 | `1,905.8509624547362 requests/second` |
-| Received / 接收速率 | `537.8236968744044 KB/second` |
-| Sent / 发送速率 | `519.2699399656947 KB/second` |
-| Average response size / 平均响应大小 | `288.9688 bytes` |
+| Average | 16 ms |
+| Maximum | 609 ms |
+| Throughput | 1905.8509624547362 requests/s |
+| 成功预留 | 1,000 |
+| 预期库存冲突 | 9,000 |
 
-The `90%` JMeter error rate is consistent with approximately `1,000` successful reservations followed by approximately `9,000` stock-exhaustion rejections. The reported throughput includes both successful and failed responses. JMeter treats expected non-2xx responses as errors, while the summary alone does not identify the response code of every failure.
+JMeter 显示的 90% error rate 来自库存售罄后的预期冲突，不代表服务异常。该结果只覆盖 Inventory 直接调用，不代表 Gateway 或完整端到端链路性能。
 
-`90%` 的 JMeter 错误率与约 `1,000` 个成功预留、约 `9,000` 个库存耗尽拒绝相符。报告中的吞吐量同时包含成功与失败响应；JMeter 会把预期的非 2xx 响应统计为错误，仅凭汇总报告无法确认每个失败请求的响应码。
+![JMeter aggregate report](./jmeter/image.png)
 
-![JMeter Aggregate Report](./jmeter/image.png)
+![JMeter response summary](./jmeter/image_2.png)
 
-![JMeter Summary Report](./jmeter/image_2.png)
+## 当前限制
 
-Separate real-HTTP correctness checks verified exact `100/900` and `1000/9000` success/conflict splits, Redis stock `0`, and matching MySQL totals without negative stock or overselling. The repeatable commands and cleanup procedure are kept in [INVENTORY_LOAD_TEST.md](./INVENTORY_LOAD_TEST.md).
+- Payment 目前完成记录创建和查询，真实支付渠道、回调及状态更新仍未完成。
+- Order 过期后 Payment 仍可能保持 `PENDING`。
+- `order.created` 已使用 Outbox；其他跨服务状态变更尚未全部采用同等级的可靠发布机制。
+- 缺少 DEAD release task 的管理、告警和人工补偿入口。
+- Ticket 售罄状态同步、通知和电子票流程尚未完成。
 
-独立的真实 HTTP 正确性测试验证了严格的 `100/900` 与 `1000/9000` 成功/冲突结果，Redis 最终库存为 `0`，MySQL 数量一致，未出现负库存或超卖。可重复执行的命令及清理步骤保存在 [INVENTORY_LOAD_TEST.md](./INVENTORY_LOAD_TEST.md)。
-
-> The JMeter test calls Inventory Service directly on port `8083`; it measures the inventory path without Gateway authentication or rate limiting.
->
-> JMeter 测试直接访问 `8083`，因此结果不包含 Gateway 鉴权与限流开销。
-
-## Current limitations / 当前限制
-
-- Reservation keys use a 15-minute technical TTL; the five-minute business deadline is enforced by `orders.expires_at` and the release-task worker.
-- Ticket status does not automatically change to `SOLD_OUT` when inventory reaches zero.
-- Kafka reservation publishing is asynchronous; the HTTP response may return before broker acknowledgement, while the failure callback attempts Redis compensation.
-- Order Service's core expiration and release flow is implemented, but it is not routed by API Gateway yet.
-- Payment has controller/DTO/schema scaffolding, but its business methods return `501`; electronic-ticket delivery, notifications, distributed tracing, and production secret management are not implemented.
-
-- 预留 Key 使用 15 分钟技术 TTL；五分钟业务截止时间由 `orders.expires_at` 与释放任务 Worker 执行。
-- 库存归零后，Ticket 状态暂时不会自动变为 `SOLD_OUT`。
-- Kafka 预留事件采用异步提交；HTTP 可能先于 Broker 确认返回，失败回调会尝试补偿 Redis。
-- Order Service 的核心过期释放流程已实现，但尚未接入 API Gateway。
-- Payment 已有 Controller、DTO 与数据库迁移骨架，但业务方法仍返回 `501`；电子票交付、通知、分布式链路追踪及生产级密钥管理尚未实现。
-
-## Security / 安全说明
-
-The current configuration is for local development only. Do not expose infrastructure ports publicly, use the sample database password in production, or commit private RSA keys.
-
-当前配置仅用于本地开发。请勿公开暴露基础设施端口、在生产环境使用示例数据库密码，或提交 RSA 私钥。
-
-For the current service boundaries, order-release flow, known limitations, and roadmap, see [DEVELOPMENT.md](./DEVELOPMENT.md).
+更多实现细节、验证命令与开发说明见 [DEVELOPMENT.md](./DEVELOPMENT.md)。

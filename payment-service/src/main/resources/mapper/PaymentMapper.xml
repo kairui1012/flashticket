@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.flashticket.paymentservice.mapper.PaymentMapper">
+
+    <resultMap id="PaymentResultMap"
+               type="com.flashticket.paymentservice.entity.Payment">
+        <id property="id" column="id"/>
+        <result property="orderId" column="order_id"/>
+        <result property="userId" column="user_id"/>
+        <result property="amount" column="amount"/>
+        <result property="status" column="status"/>
+        <result property="providerTransactionId" column="provider_transaction_id"/>
+        <result property="failureReason" column="failure_reason"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="paidAt" column="paid_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <sql id="PaymentColumns">
+        id,
+        order_id,
+        user_id,
+        amount,
+        status,
+        provider_transaction_id,
+        failure_reason,
+        created_at,
+        paid_at,
+        updated_at
+    </sql>
+
+    <insert id="insert">
+        INSERT INTO payments (
+            id,
+            order_id,
+            user_id,
+            amount,
+            status,
+            provider_transaction_id,
+            failure_reason,
+            created_at,
+            paid_at,
+            updated_at
+        ) VALUES (
+            #{id},
+            #{orderId},
+            #{userId},
+            #{amount},
+            #{status},
+            #{providerTransactionId},
+            #{failureReason},
+            #{createdAt},
+            #{paidAt},
+            #{updatedAt}
+        )
+    </insert>
+
+    <select id="findById" resultMap="PaymentResultMap">
+        SELECT
+            <include refid="PaymentColumns"/>
+        FROM payments
+        WHERE id = #{paymentId}
+    </select>
+
+    <select id="findByOrderId" resultMap="PaymentResultMap">
+        SELECT
+            <include refid="PaymentColumns"/>
+        FROM payments
+        WHERE order_id = #{orderId}
+    </select>
+
+    <update id="update">
+        UPDATE payments
+        SET status = #{status},
+            provider_transaction_id = #{providerTransactionId},
+            failure_reason = #{failureReason},
+            paid_at = #{paidAt},
+            updated_at = #{updatedAt}
+        WHERE id = #{id}
+    </update>
+
+</mapper>
