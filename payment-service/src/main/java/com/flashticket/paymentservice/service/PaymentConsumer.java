@@ -18,7 +18,8 @@ public class PaymentConsumer {
 
     @KafkaListener(
             topics = ORDER_CREATED_TOPIC,
-            groupId = "payment-service"
+            groupId = "payment-service",
+            properties = "spring.json.value.default.type=com.flashticket.paymentservice.event.OrderCreatedEvent"
     )
     public void handleOrderCreated(OrderCreatedEvent event) {
         validateEvent(event);

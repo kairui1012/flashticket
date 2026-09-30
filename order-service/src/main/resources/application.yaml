@@ -37,7 +37,7 @@ spring:
       properties:
         enable.idempotence: true
         max.in.flight.requests.per.connection: 5
-        spring.json.add.type.headers: true
+        spring.json.add.type.headers: false
 
     consumer:
       group-id: order-service
@@ -48,7 +48,6 @@ spring:
       properties:
         spring.json.trusted.packages: com.flashticket.orderservice.event
         spring.json.use.type.headers: false
-        spring.json.value.default.type: com.flashticket.orderservice.event.InventoryReservedEvent
 
     listener:
       ack-mode: record

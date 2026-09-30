@@ -80,6 +80,14 @@
         WHERE id = #{orderId}
     </select>
 
+    <select id="findByIdForUpdate" resultMap="OrderResultMap">
+        SELECT
+            <include refid="OrderColumns"/>
+        FROM orders
+        WHERE id = #{orderId}
+        FOR UPDATE
+    </select>
+
     <select id="findByUserId" resultMap="OrderResultMap">
         SELECT
             <include refid="OrderColumns"/>

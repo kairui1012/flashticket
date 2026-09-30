@@ -1,7 +1,7 @@
 package com.flashticket.inventoryservice.service;
 
-import com.flashticket.inventoryservice.entity.EventType;
-import com.flashticket.inventoryservice.entity.ProcessedEvent;
+import com.flashticket.inventoryservice.event.EventType;
+import com.flashticket.inventoryservice.event.ProcessedEvent;
 import com.flashticket.inventoryservice.event.InventoryReleaseEvent;
 import com.flashticket.inventoryservice.event.InventoryReservedEvent;
 import com.flashticket.inventoryservice.mapper.InventoryMapper;
@@ -28,7 +28,8 @@ public class InventoryEventConsumer {
     @Transactional
     @KafkaListener(
             topics = RESERVED_TOPIC,
-            groupId = "inventory-service"
+            groupId = "inventory-service",
+            properties = "spring.json.value.default.type=com.flashticket.inventoryservice.event.InventoryReservedEvent"
     )
     public void handleInventoryReserved(InventoryReservedEvent event) {
 
@@ -97,7 +98,8 @@ public class InventoryEventConsumer {
     @Transactional
     @KafkaListener(
             topics = RELEASE_TOPIC,
-            groupId = "inventory-service"
+            groupId = "inventory-service",
+            properties = "spring.json.value.default.type=com.flashticket.inventoryservice.event.InventoryReleaseEvent"
     )
     public void handleInventoryReleased(InventoryReleaseEvent event) {
 

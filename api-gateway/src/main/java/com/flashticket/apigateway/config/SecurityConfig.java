@@ -25,6 +25,7 @@ public class SecurityConfig {
 
         http.authorizeExchange(auth -> auth
                 .pathMatchers("/api/v1/auth/login", "/api/v1/auth/register").permitAll()
+                .pathMatchers(HttpMethod.POST, "/api/v1/payments/webhooks/stripe").permitAll()
                 .pathMatchers(HttpMethod.GET, "/api/v1/tickets/**",
                         "/api/v1/inventory/**").hasAnyRole("USER", "ADMIN")
                 .pathMatchers("/api/v1/tickets/**", "/api/v1/inventory/**")

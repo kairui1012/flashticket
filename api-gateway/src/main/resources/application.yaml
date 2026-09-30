@@ -34,6 +34,11 @@ spring:
               uri: ${ORDER_SERVICE_URL:http://localhost:8084}
               predicates:
                 - Path=/api/v1/orders/**
+            - id: stripe-webhook
+              order: -1
+              uri: ${PAYMENT_SERVICE_URL:http://localhost:8085}
+              predicates:
+                - Path=/api/v1/payments/webhooks/stripe
             - id: payment-service
               uri: ${PAYMENT_SERVICE_URL:http://localhost:8085}
               predicates:

@@ -54,12 +54,4 @@ public class OrderController {
         );
     }
 
-    @PostMapping("/{orderId}/paid")
-    public ResponseEntity<OrderResponse> markAsPaid(
-            @PathVariable String orderId
-    ) {
-        return ResponseEntity.ok(
-                orderService.markAsPaid(orderId)
-        );
-    }
 }

@@ -19,6 +19,8 @@ public interface OrderMapper {
 
     Order findById(@Param("orderId") String orderId);
 
+    Order findByIdForUpdate(@Param("orderId") String orderId);
+
     List<Order> findByUserId(@Param("userId") String userId);
 
     int cancelPendingOrder(

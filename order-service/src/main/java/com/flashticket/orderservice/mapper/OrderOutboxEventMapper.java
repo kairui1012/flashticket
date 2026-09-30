@@ -1,6 +1,6 @@
 package com.flashticket.orderservice.mapper;
 
-import com.flashticket.orderservice.event.InventoryReleaseEvent;
+import com.flashticket.orderservice.event.OrderOutboxEvent;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
@@ -10,9 +10,9 @@ import java.util.List;
 @Mapper
 public interface OrderOutboxEventMapper {
 
-    int insertIfAbsent(InventoryReleaseEvent.OrderOutboxEvent event);
+    int insertIfAbsent(OrderOutboxEvent event);
 
-    List<InventoryReleaseEvent.OrderOutboxEvent> findReadyEvents(
+    List<OrderOutboxEvent> findReadyEvents(
             @Param("now") LocalDateTime now,
             @Param("lockExpiredBefore") LocalDateTime lockExpiredBefore,
             @Param("limit") int limit

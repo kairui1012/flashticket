@@ -1,7 +1,5 @@
 package com.flashticket.orderservice.event;
 
-import com.flashticket.orderservice.entity.EventType;
-import com.flashticket.orderservice.entity.OrderOutboxStatus;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -27,29 +25,4 @@ public class InventoryReleaseEvent {
 
     // occurredAt -> Records when the stock release event occurred.
     private LocalDateTime occurredAt;
-
-    @Data
-    @NoArgsConstructor
-    @AllArgsConstructor
-    public static class ProcessedEvent {
-        private String eventId;
-        private EventType eventType;
-        private LocalDateTime processedAt;
-    }
-
-    @Data
-    public static class OrderOutboxEvent {
-        private String id;
-        private String aggregateId;
-        private String topic;
-        private String eventType;
-        private String payload;
-        private OrderOutboxStatus status;
-        private Integer retryCount;
-        private LocalDateTime nextRetryAt;
-        private LocalDateTime lockedAt;
-        private String lastError;
-        private LocalDateTime createdAt;
-        private LocalDateTime updatedAt;
-    }
 }

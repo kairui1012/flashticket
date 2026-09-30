@@ -1,7 +1,7 @@
 package com.flashticket.orderservice.service;
 
-import com.flashticket.orderservice.entity.EventType;
-import com.flashticket.orderservice.event.InventoryReleaseEvent;
+import com.flashticket.orderservice.event.ProcessedEvent;
+import com.flashticket.orderservice.event.EventType;
 import com.flashticket.orderservice.event.InventoryReservedEvent;
 import com.flashticket.orderservice.mapper.ProcessedEventMapper;
 import com.flashticket.orderservice.mapper.OrderMapper;
@@ -26,7 +26,8 @@ public class OrderEventConsumer {
 
     @KafkaListener(
             topics = RESERVED_TOPIC,
-            groupId = "order-service"
+            groupId = "order-service",
+            properties = "spring.json.value.default.type=com.flashticket.orderservice.event.InventoryReservedEvent"
     )
     @Transactional
     public void handleInventoryReserved(InventoryReservedEvent event) {
@@ -35,7 +36,7 @@ public class OrderEventConsumer {
         validateEvent(event);
 
         // STEP 2 -> Build the processed-event record using Kafka's stable event ID.
-        InventoryReleaseEvent.ProcessedEvent processedEvent = new InventoryReleaseEvent.ProcessedEvent(
+        ProcessedEvent processedEvent = new ProcessedEvent(
                 event.getEventId(),
                 EventType.INVENTORY_RESERVED,
                 LocalDateTime.now()

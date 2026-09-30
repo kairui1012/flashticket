@@ -7,6 +7,7 @@ import com.flashticket.orderservice.dto.OrderResponse;
 import com.flashticket.orderservice.dto.TicketPriceResponse;
 import com.flashticket.orderservice.entity.Order;
 import com.flashticket.orderservice.entity.OrderStatus;
+import com.flashticket.orderservice.entity.PaymentApplyResult;
 import com.flashticket.orderservice.mapper.OrderMapper;
 import feign.FeignException;
 import lombok.RequiredArgsConstructor;
@@ -239,10 +240,22 @@ public class OrderService {
         return response;
     }
 
+    // Marks an eligible pending-payment order as paid at the time reported by Payment Service.
+    @Transactional
+    public PaymentApplyResult markAsPaid(
+            String orderId,
+            LocalDateTime paidAt,
+            BigDecimal amount
+    ) {
+        if (paidAt == null) {
+            throw new IllegalArgumentException("paidAt must not be null");
+        }
 
-    // Marks an eligible pending-payment order as paid.
-    public OrderResponse markAsPaid(String orderId) {
-        Order order = orderMapper.findById(orderId);
+        if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new IllegalArgumentException("amount must be greater than zero");
+        }
+
+        Order order = orderMapper.findByIdForUpdate(orderId);
 
         if (order == null) {
             throw new ResponseStatusException(
@@ -251,8 +264,21 @@ public class OrderService {
             );
         }
 
-        if (order.getStatus() == OrderStatus.PAID || order.getStatus() == CANCELLED) {
-            return mapToResponse(order);
+        if (order.getStatus() == OrderStatus.EXPIRED
+                || order.getStatus() == OrderStatus.CANCELLED) {
+            return PaymentApplyResult.LATE_PAYMENT_IGNORED;
+        }
+
+        if (order.getTotalAmount() == null
+                || order.getTotalAmount().compareTo(amount) != 0) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Payment amount does not match the order total"
+            );
+        }
+
+        if (order.getStatus() == OrderStatus.PAID) {
+            return PaymentApplyResult.ALREADY_PAID;
         }
 
         if (order.getStatus() != OrderStatus.PENDING_PAYMENT) {
@@ -264,17 +290,14 @@ public class OrderService {
 
         LocalDateTime now = LocalDateTime.now();
 
-        if (!order.getExpiresAt().isAfter(now)) {
-            throw new ResponseStatusException(
-                    HttpStatus.CONFLICT,
-                    "The payment deadline has passed"
-            );
+        if (!order.getExpiresAt().isAfter(paidAt)) {
+            return PaymentApplyResult.LATE_PAYMENT_IGNORED;
         }
 
         // The conditional update prevents payment after expiration or another status change.
         int updatedRows = orderMapper.markPendingOrderAsPaid(
                 orderId,
-                now,
+                paidAt,
                 now
         );
 
@@ -286,7 +309,7 @@ public class OrderService {
         }
 
         order.setStatus(OrderStatus.PAID);
-        order.setPaidAt(now);
+        order.setPaidAt(paidAt);
         order.setUpdatedAt(now);
 
         OrderResponse response = mapToResponse(order);
@@ -303,7 +326,7 @@ public class OrderService {
                 userOrdersKey(order.getUserId())
         );
 
-        return response;
+        return PaymentApplyResult.PAID;
     }
 
     // Builds the Redis key for an individual order.

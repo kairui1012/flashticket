@@ -1,7 +1,7 @@
 package com.flashticket.orderservice.service;
 
+import com.flashticket.orderservice.event.OrderOutboxEvent;
 import com.flashticket.orderservice.entity.OrderOutboxStatus;
-import com.flashticket.orderservice.event.InventoryReleaseEvent;
 import com.flashticket.orderservice.event.OrderCreatedEvent;
 import com.flashticket.orderservice.mapper.OrderOutboxEventMapper;
 import lombok.RequiredArgsConstructor;
@@ -25,7 +25,7 @@ public class OrderOutboxService {
     public void createOrderCreatedEvent(OrderCreatedEvent event) {
         LocalDateTime now = LocalDateTime.now();
 
-        InventoryReleaseEvent.OrderOutboxEvent outboxEvent = new InventoryReleaseEvent.OrderOutboxEvent();
+        OrderOutboxEvent outboxEvent = new OrderOutboxEvent();
         outboxEvent.setId(event.getEventId());
         outboxEvent.setAggregateId(event.getOrderId());
         outboxEvent.setTopic(ORDER_CREATED_TOPIC);

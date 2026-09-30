@@ -25,7 +25,7 @@ spring:
     table: flyway_ticket_schema_history
 
   application:
-    name: tikcet-service
+    name: ticket-service
 
   data:
     redis:

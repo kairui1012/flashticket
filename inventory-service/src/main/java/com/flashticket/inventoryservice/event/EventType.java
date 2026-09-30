@@ -1,4 +1,4 @@
-package com.flashticket.orderservice.entity;
+package com.flashticket.inventoryservice.event;
 
 public enum EventType {
     INVENTORY_RESERVED,

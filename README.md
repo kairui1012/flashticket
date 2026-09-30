@@ -1,113 +1,150 @@
 # FlashTicket
 
-FlashTicket 是一个面向高并发抢票场景的微服务后端项目。系统通过 Redis Lua 原子预留库存，使用 Kafka 异步同步 MySQL、创建订单并触发支付记录，同时通过可重试任务处理取消和超时后的库存释放。
+FlashTicket is a microservices backend for high-concurrency ticket sales. It uses Redis Lua scripts for atomic inventory operations, Kafka for asynchronous workflows, MySQL for durable state, and an API Gateway for routing, authentication, and rate limiting.
 
-> 当前项目适合本地开发与架构演示，尚未完成真实支付渠道、生产级运维和全部跨服务一致性能力。
-FlashTicket is a work-in-progress microservices backend for high-concurrency ticket sales. It combines JWT-based access control, Redis Lua scripts for atomic stock reservation, Kafka events for asynchronous inventory and order processing, MySQL, and an API Gateway.
+The project demonstrates the complete path from stock reservation to order creation, payment initialization, Stripe Checkout, payment confirmation, and inventory compensation.
 
-FlashTicket 是一个面向高并发抢票场景的微服务后端项目。系统使用 JWT 进行权限控制，通过 Redis Lua 脚本原子预留库存，并使用 Kafka 异步同步库存及创建订单。目前 Auth、Ticket 与 Inventory 已接入 API Gateway，Order 仍通过 `8084` 直接访问。
+> **Project status:** Active development. The system is suitable for local development and architecture demonstrations, but is not production-ready.
 
-## 核心能力
+> **Payment scope:** Stripe Test Mode only. A payment success received after an order becomes `EXPIRED` or `CANCELLED` is recorded as processed, logged as `LATE_PAYMENT_IGNORED`, and acknowledged without retry. Automated refunds and real-money payment reconciliation are Future Work.
 
-- BCrypt 密码加密、RSA JWT 认证与 `USER` / `ADMIN` 权限控制
-- API Gateway 路由、鉴权与基于 Redis 的限流
-- Ticket 管理及 Redis 缓存
-- Redis Lua 原子库存预留与释放
-- Kafka 驱动的库存同步、订单创建和支付记录创建
-- MySQL 消费幂等与相同 `releaseId` 的重复释放保护
-- 五分钟未付款订单过期
-- 持久化库存释放任务、失败重试与最终恢复
-- Order Outbox 可靠发布 `order.created`
+## Key Capabilities
 
-## 架构
+- BCrypt password hashing and RSA-signed JWT authentication
+- Role-based access control for `USER` and `ADMIN` accounts
+- API Gateway routing, authorization, and Redis-backed rate limiting
+- Ticket management with Redis caching
+- Atomic inventory reservation and release through Redis Lua scripts
+- Kafka-driven inventory synchronization and order creation
+- Idempotent event consumption backed by MySQL
+- Five-minute payment window for pending orders
+- Durable, retryable inventory release tasks
+- Transactional Order Outbox for reliable `order.created` publication
+- Automatic creation of one pending payment per order
+- Stripe-hosted Checkout Session creation and signature-verified webhooks
+- Idempotent `payment.succeeded` handling and conditional order completion
+
+## System Architecture
 
 ```text
 Client
   |
   v
 API Gateway :8080
-  |-- Auth Service :8081 ------> MySQL
-  |-- Ticket Service :8082 ----> MySQL + Redis
-  `-- Inventory Service :8083
-          |-- Redis Lua: reserve / release
-          `-- inventory.reserved --> Kafka
-                    |-- Inventory Consumer --> MySQL inventory
-                    `-- Order Consumer ------> Order Service :8084
-                                                  |-- orders
-                                                  `-- order_outbox_events (PENDING)
-                                                          |
-                                                   Outbox Worker
-                                                          |
-                                                   order.created --> Kafka
-                                                          |
-                                                   Payment Consumer
-                                                          |
-                                                   Payment Service :8085
-                                                          |-- MySQL payments
-                                                          `-- Redis payment cache
+  |-- Auth Service :8081 ---------> MySQL
+  |-- Ticket Service :8082 -------> MySQL + Redis
+  |-- Inventory Service :8083
+  |      |-- Redis Lua reservation and release
+  |      `-- inventory.reserved --> Kafka
+  |               |-- Inventory Consumer --> Inventory MySQL
+  |               `-- Order Consumer ------> Order Service :8084
+  |                                               |-- Order MySQL
+  |                                               `-- Order Outbox
+  |                                                       |
+  |                                                order.created
+  |                                                       |
+  `-- Payment Service :8085 <---------------- Payment Consumer
+           |-- Payment MySQL
+           |-- Redis payment cache
+           `-- Stripe Checkout
+                    |
+              Signed webhook
+                    |
+             payment.succeeded --> Kafka --> Order Service --> PAID
 
-Order cancel / five-minute expiry
-  --> inventory_release_tasks
+Order cancellation or expiry
+  --> durable release task
   --> Inventory release API
-  --> Redis + MySQL stock recovery
+  --> Redis and MySQL stock recovery
 ```
 
-## 服务
+## Service Catalog
 
-| 服务 | 端口 | 当前职责 |
+| Service | Port | Responsibility |
 | --- | ---: | --- |
-| API Gateway | 8080 | Auth、Ticket、Inventory、Order、Payment 路由，JWT 鉴权与限流 |
-| Auth Service | 8081 | 注册、登录、JWT 签发 |
-| Ticket Service | 8082 | 票种 CRUD、销售状态与缓存 |
-| Inventory Service | 8083 | 库存管理、预留、释放及 Kafka 同步 |
-| Order Service | 8084 | 创建、查询、取消、标记支付、过期及 Outbox 发布 |
-| Payment Service | 8085 | 消费 `order.created`，创建和查询 `PENDING` 支付记录 |
+| API Gateway | `8080` | Routes all public APIs, validates JWTs, and applies rate limits |
+| Auth Service | `8081` | Registration, login, password hashing, and JWT issuance |
+| Ticket Service | `8082` | Ticket lifecycle, sale status, and read caching |
+| Inventory Service | `8083` | Stock management, atomic reservation, release, and inventory events |
+| Order Service | `8084` | Order lifecycle, expiry, release tasks, Outbox publication, and payment-result consumption |
+| Payment Service | `8085` | Payment creation, caching, Stripe Checkout, webhook processing, and success events |
 
-Gateway 已配置五个业务服务的 `/api/v1/**` 路由；各服务端口仍可用于本地诊断。
+Infrastructure is provided locally through Docker Compose:
 
-## 核心流程
+| Component | Port |
+| --- | ---: |
+| MySQL | `3307` |
+| Redis | `6379` |
+| Kafka | `9092` |
+| ZooKeeper | `2181` |
 
-### 预留、订单与支付记录
+## Core Workflows
 
-1. Inventory Service 向 Ticket Service 校验票种和销售时间。
-2. Redis Lua 原子检查重复预留并扣减 `availableStock`。
-3. 发布 `inventory.reserved`。
-4. Inventory Consumer 幂等增加 MySQL `reserved_stock`。
-5. Order Consumer 创建五分钟有效的 `PENDING_PAYMENT` Order，并在同一事务写入 `PENDING` Outbox。
-6. Outbox Worker 发布 `order.created`，成功后将 Outbox 标记为 `PUBLISHED`。
-7. PaymentConsumer 消费事件，创建一条 `PENDING` payment，并写入 Redis 缓存。
+### Reservation and Order Creation
 
-### 取消或超时释放
+1. Inventory Service validates the ticket and sale window through Ticket Service.
+2. A Redis Lua script checks stock and duplicate user reservations atomically.
+3. Redis available stock is reduced and a reservation key is created.
+4. Inventory Service publishes `inventory.reserved`.
+5. Inventory Consumer idempotently moves MySQL stock from available to reserved.
+6. Order Consumer creates a `PENDING_PAYMENT` order with a five-minute deadline.
+7. The same database transaction creates a pending Order Outbox record.
 
-1. 用户取消，或调度器依据 `orders.expires_at` 将五分钟未支付订单标记为 `EXPIRED`。
-2. Order Service 创建持久化的 `inventory_release_tasks`。
-3. Worker 使用固定 `releaseId` 请求 Inventory Service 释放库存。
-4. Inventory Service 通过 Lua 和事件幂等保护，确保重复请求不会重复增加库存。
-5. 暂时失败的任务进入 `RETRY`；服务恢复后重试至 `SUCCESS`。
+### Payment
 
-Redis reservation key 的 15 分钟 TTL 只是安全缓冲，订单的五分钟 `expires_at` 才是业务过期依据。
+1. The Outbox worker publishes `order.created` and marks the record as `PUBLISHED` after Kafka acknowledgment.
+2. Payment Consumer creates one `PENDING` payment for the order.
+3. Payment Service caches the payment by payment ID and order ID for five minutes.
+4. The client requests a Stripe-hosted Checkout Session.
+5. Payment Service verifies Stripe webhook signatures and accepts paid `checkout.session.completed` events.
+6. A conditional MySQL update changes the payment from `PENDING` to `SUCCEEDED`.
+7. Payment Service publishes `payment.succeeded`.
+8. Order Service consumes the event idempotently and changes an eligible order to `PAID`.
 
-## 技术栈
+The order amount, status, and expiry are read from Order Service and are not trusted from the client request.
 
-| 范围 | 技术 |
+### Cancellation and Expiry
+
+1. A user cancels an order, or the scheduler expires an unpaid order using `orders.expires_at`.
+2. Order Service conditionally changes the order from `PENDING_PAYMENT` to `CANCELLED` or `EXPIRED`.
+3. A durable `inventory_release_tasks` record is created with a stable `releaseId`.
+4. The release worker calls Inventory Service.
+5. Redis and MySQL idempotency controls ensure that duplicate release requests restore stock only once.
+6. Temporary failures move the task to `RETRY`; successful retries move it to `SUCCESS`.
+
+The 15-minute Redis reservation TTL is a safety buffer. The five-minute `orders.expires_at` value is the business deadline.
+
+## Technology Stack
+
+| Area | Technology |
 | --- | --- |
 | Runtime | Java 21, Spring Boot 4.1.1 |
+| Gateway | Spring Cloud Gateway |
 | Security | Spring Security, OAuth2 Resource Server, RSA JWT |
-| Data | MySQL 8, MyBatis, Flyway |
-| Cache / concurrency | Redis, Lua |
-| Messaging | Kafka, ZooKeeper |
-| Build / infrastructure | Maven Wrapper, Docker Compose |
-| Load test | Apache JMeter 5.6.3 |
+| Persistence | MySQL 8, MyBatis, Flyway |
+| Cache and concurrency | Redis, Lua |
+| Messaging | Apache Kafka, ZooKeeper |
+| Payments | Stripe Java SDK, Stripe Checkout, Stripe webhooks |
+| Build and infrastructure | Maven Wrapper, Docker Compose |
+| Load testing | Apache JMeter 5.6.3 |
 
-## 本地运行
+## Local Development
 
-前置条件：Java 21、Docker、Docker Compose。
+### Prerequisites
+
+- Java 21
+- Docker and Docker Compose
+- OpenSSL
+- Stripe CLI for local webhook testing, if required
+
+### 1. Start Infrastructure
 
 ```bash
 docker compose up -d
+docker compose ps
 ```
 
-首次运行 Auth Service 前生成 RSA 密钥：
+### 2. Generate Local RSA Keys
 
 ```bash
 mkdir -p keys
@@ -120,10 +157,34 @@ openssl rsa \
   -out keys/public.pem
 ```
 
-分别在独立终端启动服务：
+Do not commit private keys or use local credentials in a production environment.
+
+### 3. Configure Stripe
+
+Payment Service reads the following environment variables:
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `STRIPE_SECRET_KEY` | For Checkout | Stripe secret API key |
+| `STRIPE_WEBHOOK_SECRET` | For webhooks | Signing secret used to verify Stripe webhook payloads |
+| `STRIPE_CURRENCY` | No | Payment currency; defaults to `myr` |
+| `STRIPE_SUCCESS_URL` | No | Browser redirect after successful checkout |
+| `STRIPE_CANCEL_URL` | No | Browser redirect after checkout cancellation |
+
+Keep all Stripe secrets outside source control.
+
+### 4. Start the Services
+
+Run each service in a separate terminal:
 
 ```bash
-cd auth-service && JWT_PRIVATE_KEY=file:../keys/private.pem JWT_PUBLIC_KEY=file:../keys/public.pem ./mvnw spring-boot:run
+cd auth-service
+JWT_PRIVATE_KEY=file:../keys/private.pem \
+JWT_PUBLIC_KEY=file:../keys/public.pem \
+./mvnw spring-boot:run
+```
+
+```bash
 cd ticket-service && ./mvnw spring-boot:run
 cd inventory-service && ./mvnw spring-boot:run
 cd order-service && ./mvnw spring-boot:run
@@ -131,83 +192,96 @@ cd payment-service && ./mvnw spring-boot:run
 cd api-gateway && ./mvnw spring-boot:run
 ```
 
-检查主要业务服务：
+### 5. Check Service Health
 
 ```bash
+curl http://localhost:8080/actuator/health
 curl http://localhost:8082/actuator/health
 curl http://localhost:8083/actuator/health
 curl http://localhost:8084/actuator/health
 curl http://localhost:8085/actuator/health
 ```
 
-## 主要 API
+## API Summary
 
-| 方法 | 地址 | 用途 |
+All public routes are available through the API Gateway at `http://localhost:8080`.
+
+| Method | Endpoint | Purpose |
 | --- | --- | --- |
-| POST | `http://localhost:8080/api/v1/auth/register` | 注册 |
-| POST | `http://localhost:8080/api/v1/auth/login` | 登录 |
-| GET / POST | `http://localhost:8080/api/v1/tickets` | 查询 / 创建票种 |
-| POST | `http://localhost:8080/api/v1/inventory/{ticketId}/reserve` | 预留库存 |
-| POST | `http://localhost:8080/api/v1/inventory/release` | 幂等释放库存 |
-| GET | `http://localhost:8080/api/v1/orders/{orderId}` | 查询订单 |
-| POST | `http://localhost:8080/api/v1/orders/{orderId}/cancel` | 取消订单 |
-| POST | `http://localhost:8080/api/v1/orders/{orderId}/paid` | 标记订单已支付 |
-| POST | `http://localhost:8080/api/v1/payments` | 手动创建支付记录 |
-| GET | `http://localhost:8080/api/v1/payments/{paymentId}` | 查询支付记录 |
+| `POST` | `/api/v1/auth/register` | Register an account |
+| `POST` | `/api/v1/auth/login` | Authenticate and issue a JWT |
+| `GET` | `/api/v1/tickets/{ticketId}` | Get a ticket |
+| `POST` | `/api/v1/tickets` | Create a ticket |
+| `GET` | `/api/v1/inventory/{ticketId}` | Get inventory |
+| `POST` | `/api/v1/inventory/{ticketId}/reserve` | Reserve stock |
+| `POST` | `/api/v1/inventory/release` | Release reserved stock idempotently |
+| `GET` | `/api/v1/orders/{orderId}` | Get an order |
+| `GET` | `/api/v1/orders/user/{userId}` | List orders for a user |
+| `POST` | `/api/v1/orders/{orderId}/cancel` | Cancel a pending order |
+| `POST` | `/api/v1/payments` | Create or retrieve the payment for an order |
+| `GET` | `/api/v1/payments/{paymentId}` | Get a payment by ID |
+| `GET` | `/api/v1/payments/order/{orderId}` | Get a payment by order ID |
+| `POST` | `/api/v1/payments/{paymentId}/checkout-session` | Create a Stripe Checkout Session |
+| `POST` | `/api/v1/payments/webhooks/stripe` | Receive a signed Stripe webhook |
 
-正常业务流中 payment 由 `order.created` 自动触发，无需手动调用创建接口。
+Under the normal event-driven flow, `order.created` creates the payment automatically. The manual payment creation endpoint remains idempotent for recovery and local diagnostics.
 
-## 实机验证
+## Verification
 
-以下结果来自真实启动的 MySQL、Redis、Kafka 和微服务，不是单元测试或模拟结果。
+### Build Verification
 
-### 库存释放链路（2026-09-27）
+On 2026-10-01, the following modules compiled successfully with `./mvnw -DskipTests compile`:
 
-| 场景 | 验证结果 |
-| --- | --- |
-| 正常预留 | Redis `availableStock` 减少，reservation key 存在，MySQL `reserved_stock` 增加，Order 为 `PENDING_PAYMENT` |
-| 用户取消 | Order 为 `CANCELLED`，release task 为 `SUCCESS`，Redis / MySQL 库存恢复 |
-| 五分钟未付款 | Order 在 `expires_at` 后变成 `EXPIRED`，release task 为 `SUCCESS`，库存恢复 |
-| 重复释放 | 相同 `releaseId` 请求两次均安全返回，Redis 只增加一次，MySQL 只释放一次 |
-| Inventory 暂时不可用 | release task 先进入 `RETRY`，Inventory 恢复后变成 `SUCCESS`，库存最终恢复为 `available=10, reserved=0` |
+- API Gateway
+- Order Service
+- Payment Service
 
-### Order Outbox 与 Payment（2026-09-29）
+Compilation confirms source compatibility only; it does not replace runtime or integration testing.
 
-| 检查点 | 实际结果 |
-| --- | --- |
-| 库存预留 | HTTP 200；库存由 `10/0` 变为 `8/2` |
-| Order | 创建为 `PENDING_PAYMENT`，金额 `70.00` |
-| Outbox | `PENDING -> PROCESSING -> PUBLISHED`，`retry_count=0` |
-| Kafka | `order.created` 包含相同 order、user、amount 和 expiresAt；consumer lag 为 0 |
-| Payment | `payments` 表生成一条 `PENDING` 记录，金额 `70.00` |
-| Redis | `payment:{paymentId}` 与 `payment:order:{orderId}` 均出现，TTL 为 300 秒 |
+### Runtime Validation
 
-五分钟后 Redis payment 缓存按 TTL 到期，Order 正常变成 `EXPIRED`。当前 Payment 记录仍保持 `PENDING`，这是尚待补齐的跨服务状态同步。
+The following scenarios were validated against running services with real HTTP requests, MySQL, Redis, and Kafka:
 
-## 并发压测
+| Date | Scenario | Result |
+| --- | --- | --- |
+| 2026-09-27 | Normal reservation | Redis stock decreased, the reservation key existed, MySQL reserved stock increased, and a `PENDING_PAYMENT` order was created |
+| 2026-09-27 | User cancellation | Order became `CANCELLED`, the release task reached `SUCCESS`, and Redis/MySQL stock was restored |
+| 2026-09-27 | Five-minute expiry | Order became `EXPIRED`, the release task reached `SUCCESS`, and stock was restored |
+| 2026-09-27 | Duplicate release | Two requests with the same `releaseId` were safe; Redis and MySQL released stock once |
+| 2026-09-27 | Inventory outage | The release task entered `RETRY`, then reached `SUCCESS` after Inventory Service recovered |
+| 2026-09-29 | Order Outbox and payment creation | Outbox moved to `PUBLISHED`, Kafka consumer lag reached zero, one `PENDING` payment was inserted, and both payment cache keys were created |
 
-JMeter 直接请求 Inventory Service 的库存预留接口：200 threads、5 秒 ramp-up、每线程 50 次，共 10,000 次请求；初始库存为 1,000。
+The Stripe Checkout and `payment.succeeded` path is implemented and compiles, but is not included in the runtime evidence above.
 
-| 指标 | 结果 |
+## Performance Test
+
+JMeter called Inventory Service directly with 200 threads, a five-second ramp-up, 50 iterations per thread, and 1,000 units of initial stock.
+
+| Metric | Result |
 | --- | ---: |
-| Average | 16 ms |
-| Maximum | 609 ms |
-| Throughput | 1905.8509624547362 requests/s |
-| 成功预留 | 1,000 |
-| 预期库存冲突 | 9,000 |
+| Requests | 10,000 |
+| Average response time | 16 ms |
+| Maximum response time | 609 ms |
+| Throughput | 1,905.85 requests/second |
+| Successful reservations | 1,000 |
+| Expected sold-out conflicts | 9,000 |
 
-JMeter 显示的 90% error rate 来自库存售罄后的预期冲突，不代表服务异常。该结果只覆盖 Inventory 直接调用，不代表 Gateway 或完整端到端链路性能。
+The reported 90% JMeter error rate represents expected sold-out conflicts after the available stock was exhausted. This benchmark covers direct Inventory Service calls and does not represent API Gateway or full end-to-end capacity.
 
 ![JMeter aggregate report](./jmeter/image.png)
 
 ![JMeter response summary](./jmeter/image_2.png)
 
-## 当前限制
+## Known Limitations
 
-- Payment 目前完成记录创建和查询，真实支付渠道、回调及状态更新仍未完成。
-- Order 过期后 Payment 仍可能保持 `PENDING`。
-- `order.created` 已使用 Outbox；其他跨服务状态变更尚未全部采用同等级的可靠发布机制。
-- 缺少 DEAD release task 的管理、告警和人工补偿入口。
-- Ticket 售罄状态同步、通知和电子票流程尚未完成。
+- Stripe integration is restricted to Test Mode; real-money refunds and reconciliation are not implemented.
+- The Stripe Checkout and webhook workflow still requires end-to-end runtime validation.
+- An expired order can leave its existing payment record in `PENDING`; expiry-to-payment cancellation is not implemented.
+- `order.created` uses the Outbox pattern, but not every cross-service state change has equivalent durable publication.
+- Administrative recovery, alerting, and reconciliation for `DEAD` release tasks are not implemented.
+- Ticket sold-out synchronization, notifications, and ticket issuance are outside the current completed scope.
+- Local infrastructure uses development credentials and does not include production hardening, observability, or deployment automation.
 
-更多实现细节、验证命令与开发说明见 [DEVELOPMENT.md](./DEVELOPMENT.md)。
+## Additional Documentation
+
+See [DEVELOPMENT.md](./DEVELOPMENT.md) for lower-level implementation notes and historical development details. Where it differs from this README, the current source code and this README take precedence.

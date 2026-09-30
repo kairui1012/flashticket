@@ -1,4 +1,4 @@
-package com.flashticket.inventoryservice.entity;
+package com.flashticket.orderservice.event;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;
