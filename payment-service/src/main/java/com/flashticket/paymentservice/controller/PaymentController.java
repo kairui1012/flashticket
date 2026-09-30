@@ -3,7 +3,6 @@ package com.flashticket.paymentservice.controller;
 import com.flashticket.paymentservice.dto.CreatePaymentRequest;
 import com.flashticket.paymentservice.dto.CheckoutSessionResponse;
 import com.flashticket.paymentservice.dto.PaymentResponse;
-import com.flashticket.paymentservice.dto.UpdatePaymentRequest;
 import com.flashticket.paymentservice.service.PaymentService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -58,14 +57,4 @@ public class PaymentController {
                 .body(paymentService.createCheckoutSession(paymentId));
     }
 
-    // Updates the status and provider details of one payment.
-    @PatchMapping("/{paymentId}")
-    public ResponseEntity<PaymentResponse> updatePayment(
-            @PathVariable String paymentId,
-            @Valid @RequestBody UpdatePaymentRequest request
-    ) {
-        return ResponseEntity.ok(
-                paymentService.updatePayment(paymentId, request)
-        );
-    }
 }

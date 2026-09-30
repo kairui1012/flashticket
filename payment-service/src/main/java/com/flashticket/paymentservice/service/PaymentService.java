@@ -5,18 +5,22 @@ import com.flashticket.paymentservice.dto.CheckoutSessionResponse;
 import com.flashticket.paymentservice.dto.CreatePaymentRequest;
 import com.flashticket.paymentservice.dto.OrderResponse;
 import com.flashticket.paymentservice.dto.PaymentResponse;
-import com.flashticket.paymentservice.dto.UpdatePaymentRequest;
 import com.flashticket.paymentservice.entity.OrderStatus;
 import com.flashticket.paymentservice.entity.Payment;
 import com.flashticket.paymentservice.entity.PaymentStatus;
+import com.flashticket.paymentservice.event.PaymentSucceededEvent;
 import com.flashticket.paymentservice.mapper.PaymentMapper;
 import com.stripe.StripeClient;
 import com.stripe.exception.StripeException;
 import com.stripe.model.checkout.Session;
+import com.stripe.net.RequestOptions;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.http.HttpStatus;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 import com.flashticket.paymentservice.config.StripeProperties;
@@ -34,12 +38,16 @@ import java.util.UUID;
 public class PaymentService {
 
     private static final Duration PAYMENT_CACHE_TTL = Duration.ofMinutes(5);
+    private static final Logger log = LoggerFactory.getLogger(PaymentService.class);
+    private final KafkaTemplate<String, PaymentSucceededEvent> kafkaTemplate;
+    private static final String PAYMENT_SUCCESS_TOPIC = "payment.succeeded";
     private final OrderClient orderClient;
     private final PaymentMapper paymentMapper;
     private final RedisTemplate<String,PaymentResponse> redisTemplate;
     private final StripeProperties stripeProperties;
 
 
+    // Creates one payment per order and caches the result.
     public PaymentResponse createPayment(CreatePaymentRequest request) {
         PaymentResponse cachedOfOrderId = redisTemplate.opsForValue().get(
                 paymentCacheKeyOfOrderId(request.getOrderId())
@@ -120,6 +128,7 @@ public class PaymentService {
         return response;
     }
 
+    // Reads by payment ID using Redis as a cache.
     public PaymentResponse getPaymentById(String paymentId) {
         PaymentResponse cached = redisTemplate.opsForValue().get(
                 paymentCacheKey(paymentId)
@@ -149,6 +158,7 @@ public class PaymentService {
         return response;
     }
 
+    // Reads by order ID using Redis as a cache.
     public PaymentResponse getPaymentByOrderId(String orderId) {
         PaymentResponse cached = redisTemplate.opsForValue().get(
                 paymentCacheKeyOfOrderId(orderId)
@@ -178,35 +188,114 @@ public class PaymentService {
         return response;
     }
 
-    public PaymentResponse updatePayment(
+    /**
+     * Atomically marks a pending payment as succeeded and publishes the result.
+     * Repeated Stripe webhooks are handled idempotently and are not republished.
+     */
+    public void markPaymentSucceeded(
             String paymentId,
-            UpdatePaymentRequest request
+            String orderId,
+            String providerTransactionId,
+            LocalDateTime paidAt
     ) {
-        throw notImplemented();
-    }
+        if (paymentId == null || paymentId.isBlank()
+                || orderId == null || orderId.isBlank()
+                || providerTransactionId == null || providerTransactionId.isBlank()
+                || paidAt == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "Payment success data is incomplete"
+            );
+        }
 
-    private ResponseStatusException notImplemented() {
-        return new ResponseStatusException(
-                HttpStatus.NOT_IMPLEMENTED,
-                "Payment processing has not been implemented yet"
+        int updatedRows;
+
+        // MySQL is the source of truth for the PENDING -> SUCCEEDED transition.
+        try {
+            updatedRows = paymentMapper.markSucceeded(
+                    paymentId,
+                    orderId,
+                    providerTransactionId,
+                    paidAt
+            );
+        } catch (DuplicateKeyException exception) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Provider transaction is already linked to another payment",
+                    exception
+            );
+        }
+
+        // Reload the persisted state instead of relying on a potentially stale cache.
+        Payment payment = paymentMapper.findById(paymentId);
+
+        if (payment == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.NOT_FOUND,
+                    "Payment not found: " + paymentId
+            );
+        }
+
+        if (updatedRows == 1) {
+            PaymentResponse response = mapToResponse(payment);
+            cachePayment(response);
+
+            // Publish only when this request performs the state transition.
+            PaymentSucceededEvent paymentSucceededEvent = new PaymentSucceededEvent();
+            paymentSucceededEvent.setEventId(UUID.randomUUID().toString());
+            paymentSucceededEvent.setPaymentId(payment.getId());
+            paymentSucceededEvent.setOrderId(payment.getOrderId());
+            paymentSucceededEvent.setProviderTransactionId(payment.getProviderTransactionId());
+            paymentSucceededEvent.setAmount(payment.getAmount());
+            paymentSucceededEvent.setPaidAt(payment.getPaidAt());
+            paymentSucceededEvent.setOccurredAt(LocalDateTime.now());
+
+            // The order ID keeps events for the same order on the same Kafka partition.
+            kafkaTemplate.send(
+                    PAYMENT_SUCCESS_TOPIC,
+                    payment.getOrderId(),
+                    paymentSucceededEvent
+            );
+
+            log.info(
+                    "Payment marked as succeeded: paymentId={}, orderId={}, providerTransactionId={}",
+                    paymentId,
+                    orderId,
+                    providerTransactionId
+            );
+            return;
+        }
+
+        if (!orderId.equals(payment.getOrderId())) {
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Payment does not belong to order: " + orderId
+            );
+        }
+
+        if (payment.getStatus() == PaymentStatus.SUCCEEDED) {
+            if (providerTransactionId.equals(payment.getProviderTransactionId())) {
+                PaymentResponse response = mapToResponse(payment);
+                cachePayment(response);
+
+                log.info(
+                        "Payment success was already processed: paymentId={}, providerTransactionId={}",
+                        paymentId,
+                        providerTransactionId
+                );
+                return;
+            }
+
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Payment already succeeded with a different provider transaction"
+            );
+        }
+
+        throw new ResponseStatusException(
+                HttpStatus.CONFLICT,
+                "Payment cannot succeed from status: " + payment.getStatus()
         );
-    }
-
-    private PaymentResponse mapToResponse(Payment payment) {
-        PaymentResponse response = new PaymentResponse();
-
-        response.setId(payment.getId());
-        response.setOrderId(payment.getOrderId());
-        response.setUserId(payment.getUserId());
-        response.setAmount(payment.getAmount());
-        response.setStatus(payment.getStatus());
-        response.setProviderTransactionId(payment.getProviderTransactionId());
-        response.setFailureReason(payment.getFailureReason());
-        response.setCreatedAt(payment.getCreatedAt());
-        response.setPaidAt(payment.getPaidAt());
-        response.setUpdatedAt(payment.getUpdatedAt());
-
-        return response;
     }
 
     private String paymentCacheKey(String paymentId) {
@@ -217,11 +306,10 @@ public class PaymentService {
         return "payment:order:" + orderId;
     }
 
+    // Validates the payment and creates a Stripe-hosted checkout session.
     public CheckoutSessionResponse createCheckoutSession(String paymentId) {
-        Payment payment = paymentMapper.findById(paymentId);
-        StripeClient client =
-                new StripeClient(stripeProperties.getSecretKey());
 
+        Payment payment = paymentMapper.findById(paymentId);
 
         if (payment == null) {
             throw new ResponseStatusException(
@@ -321,11 +409,36 @@ public class PaymentService {
                         .addLineItem(lineItem)
                         .build();
 
+        RequestOptions requestOptions = RequestOptions.builder().setIdempotencyKey(
+                "checkout-session:" + payment.getId()
+        ).build();
+
+        if (stripeProperties.getSecretKey() == null
+                || stripeProperties.getSecretKey().isBlank()) {
+            throw new ResponseStatusException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    "Stripe secret key is not configured"
+            );
+        }
+
+        StripeClient client =
+                new StripeClient(stripeProperties.getSecretKey());
+
         try {
             Session session = client.v1()
                     .checkout()
                     .sessions()
-                    .create(params);
+                    .create(params, requestOptions);
+
+            if (session.getId() == null
+                    || session.getId().isBlank()
+                    || session.getUrl() == null
+                    || session.getUrl().isBlank()) {
+                throw new ResponseStatusException(
+                        HttpStatus.BAD_GATEWAY,
+                        "Stripe did not return a valid Checkout Session"
+                );
+            }
 
             return new CheckoutSessionResponse(
                     payment.getId(),
@@ -342,6 +455,7 @@ public class PaymentService {
         }
     }
 
+    // Refreshes both payment lookup keys with the same data.
     private void cachePayment(PaymentResponse response) {
         redisTemplate.opsForValue().set(
                 paymentCacheKey(response.getId()),
@@ -356,5 +470,22 @@ public class PaymentService {
         );
     }
 
+    // Converts the persistence entity into the API response model.
+    private PaymentResponse mapToResponse(Payment payment) {
+        PaymentResponse response = new PaymentResponse();
+
+        response.setId(payment.getId());
+        response.setOrderId(payment.getOrderId());
+        response.setUserId(payment.getUserId());
+        response.setAmount(payment.getAmount());
+        response.setStatus(payment.getStatus());
+        response.setProviderTransactionId(payment.getProviderTransactionId());
+        response.setFailureReason(payment.getFailureReason());
+        response.setCreatedAt(payment.getCreatedAt());
+        response.setPaidAt(payment.getPaidAt());
+        response.setUpdatedAt(payment.getUpdatedAt());
+
+        return response;
+    }
 
 }

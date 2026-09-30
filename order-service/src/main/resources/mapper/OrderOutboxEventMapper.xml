@@ -6,7 +6,7 @@
 <mapper namespace="com.flashticket.orderservice.mapper.OrderOutboxEventMapper">
 
     <resultMap id="OrderOutboxEventResultMap"
-               type="com.flashticket.orderservice.entity.OrderOutboxEvent">
+               type="com.flashticket.orderservice.event.InventoryReleaseEvent.OrderOutboxEvent">
         <id property="id" column="id"/>
         <result property="aggregateId" column="aggregate_id"/>
         <result property="topic" column="topic"/>

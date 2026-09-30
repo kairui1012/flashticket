@@ -4,6 +4,8 @@ import com.flashticket.paymentservice.entity.Payment;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
+import java.time.LocalDateTime;
+
 @Mapper
 
 public interface PaymentMapper {
@@ -14,5 +16,11 @@ public interface PaymentMapper {
 
     Payment findByOrderId(@Param("orderId") String orderId);
 
-    int update(Payment payment);
+    int markSucceeded(
+            @Param("paymentId") String paymentId,
+            @Param("orderId") String orderId,
+            @Param("providerTransactionId") String providerTransactionId,
+            @Param("paidAt") LocalDateTime paidAt
+    );
+
 }

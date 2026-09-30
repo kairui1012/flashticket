@@ -1,7 +1,7 @@
 package com.flashticket.orderservice.service;
 
 import com.flashticket.orderservice.entity.EventType;
-import com.flashticket.orderservice.entity.ProcessedEvent;
+import com.flashticket.orderservice.event.InventoryReleaseEvent;
 import com.flashticket.orderservice.event.InventoryReservedEvent;
 import com.flashticket.orderservice.mapper.ProcessedEventMapper;
 import com.flashticket.orderservice.mapper.OrderMapper;
@@ -33,9 +33,9 @@ public class OrderEventConsumer {
 
         // STEP 1 -> Validate the Kafka payload before using it in idempotency or stock updates.
         validateEvent(event);
-        
+
         // STEP 2 -> Build the processed-event record using Kafka's stable event ID.
-        ProcessedEvent processedEvent = new ProcessedEvent(
+        InventoryReleaseEvent.ProcessedEvent processedEvent = new InventoryReleaseEvent.ProcessedEvent(
                 event.getEventId(),
                 EventType.INVENTORY_RESERVED,
                 LocalDateTime.now()

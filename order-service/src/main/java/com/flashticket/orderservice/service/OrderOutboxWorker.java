@@ -1,6 +1,6 @@
 package com.flashticket.orderservice.service;
 
-import com.flashticket.orderservice.entity.OrderOutboxEvent;
+import com.flashticket.orderservice.event.InventoryReleaseEvent;
 import com.flashticket.orderservice.event.OrderCreatedEvent;
 import com.flashticket.orderservice.mapper.OrderOutboxEventMapper;
 import lombok.RequiredArgsConstructor;
@@ -36,18 +36,18 @@ public class OrderOutboxWorker {
         LocalDateTime now = LocalDateTime.now();
         LocalDateTime lockExpiredBefore = now.minus(LOCK_TIMEOUT);
 
-        List<OrderOutboxEvent> events = outboxEventMapper.findReadyEvents(
+        List<InventoryReleaseEvent.OrderOutboxEvent> events = outboxEventMapper.findReadyEvents(
                 now,
                 lockExpiredBefore,
                 BATCH_SIZE
         );
 
-        for (OrderOutboxEvent event : events) {
+        for (InventoryReleaseEvent.OrderOutboxEvent event : events) {
             publishOne(event);
         }
     }
 
-    private void publishOne(OrderOutboxEvent outboxEvent) {
+    private void publishOne(InventoryReleaseEvent.OrderOutboxEvent outboxEvent) {
         LocalDateTime now = LocalDateTime.now();
 
         int claimed = outboxEventMapper.markProcessing(
@@ -99,7 +99,7 @@ public class OrderOutboxWorker {
     }
 
     private void handleFailure(
-            OrderOutboxEvent outboxEvent,
+            InventoryReleaseEvent.OrderOutboxEvent outboxEvent,
             Exception exception
     ) {
         int retryCount = outboxEvent.getRetryCount() + 1;

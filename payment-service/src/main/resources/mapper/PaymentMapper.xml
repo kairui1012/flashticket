@@ -72,14 +72,15 @@
         WHERE order_id = #{orderId}
     </select>
 
-    <update id="update">
+    <update id="markSucceeded">
         UPDATE payments
-        SET status = #{status},
+        SET status = 'SUCCEEDED',
             provider_transaction_id = #{providerTransactionId},
-            failure_reason = #{failureReason},
             paid_at = #{paidAt},
-            updated_at = #{updatedAt}
-        WHERE id = #{id}
+            updated_at = #{paidAt}
+        WHERE id = #{paymentId}
+          AND order_id = #{orderId}
+          AND status = 'PENDING'
     </update>
 
 </mapper>
