@@ -4,6 +4,7 @@ import com.flashticket.orderservice.dto.OrderResponse;
 import com.flashticket.orderservice.entity.ExpireResult;
 import com.flashticket.orderservice.entity.Order;
 import com.flashticket.orderservice.entity.OrderStatus;
+import com.flashticket.orderservice.event.OrderTerminatedEvent;
 import com.flashticket.orderservice.mapper.OrderMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -13,6 +14,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.UUID;
 
 @RequiredArgsConstructor
 @Slf4j
@@ -24,6 +26,7 @@ public class OrderExpirationService {
 
     private final OrderMapper orderMapper;
     private final InventoryReleaseTaskService inventoryReleaseTaskService;
+    private final OrderOutboxService orderOutboxService;
     private final RedisTemplate<String, OrderResponse> redisTemplate;
     private final RedisTemplate<String, List<OrderResponse>> redisTemplateForOrderList;
 
@@ -52,6 +55,15 @@ public class OrderExpirationService {
                 order.getUserId(),
                 order.getQuantity(),
                 OrderStatus.EXPIRED
+        );
+
+        orderOutboxService.createOrderTerminatedEvent(
+                new OrderTerminatedEvent(
+                        UUID.randomUUID().toString(),
+                        order.getId(),
+                        OrderStatus.EXPIRED,
+                        now
+                )
         );
 
         // Remove the stale PENDING_PAYMENT entry for this order.

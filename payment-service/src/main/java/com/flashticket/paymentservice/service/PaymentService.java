@@ -22,6 +22,7 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 import com.flashticket.paymentservice.config.StripeProperties;
 import com.stripe.param.checkout.SessionCreateParams;
@@ -295,6 +296,74 @@ public class PaymentService {
         throw new ResponseStatusException(
                 HttpStatus.CONFLICT,
                 "Payment cannot succeed from status: " + payment.getStatus()
+        );
+    }
+
+    @Transactional
+    public void markOrderTerminated(
+            String orderId,
+            OrderStatus orderStatus,
+            LocalDateTime occurredAt
+    ) {
+        if (orderId == null || orderId.isBlank()
+                || orderStatus == null
+                || occurredAt == null) {
+            throw new IllegalArgumentException("Order termination data is incomplete");
+        }
+
+        PaymentStatus targetStatus;
+        String failureReason;
+
+        if (orderStatus == OrderStatus.CANCELLED) {
+            targetStatus = PaymentStatus.CANCELLED;
+            failureReason = "ORDER_CANCELLED";
+        } else if (orderStatus == OrderStatus.EXPIRED) {
+            targetStatus = PaymentStatus.EXPIRED;
+            failureReason = "ORDER_EXPIRED";
+        } else {
+            throw new IllegalArgumentException(
+                    "Unsupported terminal order status: " + orderStatus
+            );
+        }
+
+        int updatedRows = paymentMapper.markTerminated(
+                orderId,
+                targetStatus,
+                failureReason,
+                occurredAt
+        );
+
+        Payment payment = paymentMapper.findByOrderId(orderId);
+
+        if (payment == null) {
+            throw new IllegalStateException("Payment not found for terminated order: " + orderId);
+        }
+
+        if (updatedRows == 0 && payment.getStatus() != targetStatus) {
+            if (payment.getStatus() == PaymentStatus.SUCCEEDED) {
+                log.warn(
+                        "Order terminated after payment succeeded; reconciliation is required: "
+                                + "paymentId={}, orderId={}, orderStatus={}",
+                        payment.getId(),
+                        orderId,
+                        orderStatus
+                );
+                return;
+            }
+
+            throw new IllegalStateException(
+                    "Payment cannot transition to " + targetStatus
+                            + " from status: " + payment.getStatus()
+            );
+        }
+
+        cachePayment(mapToResponse(payment));
+
+        log.info(
+                "Payment synchronized with terminal order: paymentId={}, orderId={}, status={}",
+                payment.getId(),
+                orderId,
+                payment.getStatus()
         );
     }
 

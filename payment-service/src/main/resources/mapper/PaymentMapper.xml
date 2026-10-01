@@ -83,4 +83,13 @@
           AND status = 'PENDING'
     </update>
 
+    <update id="markTerminated">
+        UPDATE payments
+        SET status = #{status},
+            failure_reason = #{failureReason},
+            updated_at = #{updatedAt}
+        WHERE order_id = #{orderId}
+          AND status = 'PENDING'
+    </update>
+
 </mapper>

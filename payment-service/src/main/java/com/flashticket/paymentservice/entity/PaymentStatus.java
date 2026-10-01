@@ -16,6 +16,9 @@ public enum PaymentStatus {
     // The payment was cancelled before completion.
     CANCELLED,
 
+    // The order payment deadline passed before completion.
+    EXPIRED,
+
     // A previously successful payment was refunded.
     REFUNDED
 }

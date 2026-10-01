@@ -2,6 +2,7 @@ package com.flashticket.orderservice.service;
 
 import com.flashticket.orderservice.event.OrderOutboxEvent;
 import com.flashticket.orderservice.event.OrderCreatedEvent;
+import com.flashticket.orderservice.event.OrderTerminatedEvent;
 import com.flashticket.orderservice.mapper.OrderOutboxEventMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -61,10 +62,7 @@ public class OrderOutboxWorker {
         }
 
         try {
-            OrderCreatedEvent event = objectMapper.readValue(
-                    outboxEvent.getPayload(),
-                    OrderCreatedEvent.class
-            );
+            Object event = deserializeEvent(outboxEvent);
 
             kafkaTemplate.send(
                     outboxEvent.getTopic(),
@@ -96,6 +94,22 @@ public class OrderOutboxWorker {
 
             handleFailure(outboxEvent, exception);
         }
+    }
+
+    private Object deserializeEvent(OrderOutboxEvent outboxEvent) {
+        return switch (outboxEvent.getEventType()) {
+            case "ORDER_CREATED" -> objectMapper.readValue(
+                    outboxEvent.getPayload(),
+                    OrderCreatedEvent.class
+            );
+            case "ORDER_TERMINATED" -> objectMapper.readValue(
+                    outboxEvent.getPayload(),
+                    OrderTerminatedEvent.class
+            );
+            default -> throw new IllegalArgumentException(
+                    "Unsupported order outbox event type: " + outboxEvent.getEventType()
+            );
+        };
     }
 
     private void handleFailure(

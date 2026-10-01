@@ -2,6 +2,7 @@ package com.flashticket.orderservice.service;
 
 import com.flashticket.orderservice.event.InventoryReservedEvent;
 import com.flashticket.orderservice.event.OrderCreatedEvent;
+import com.flashticket.orderservice.event.OrderTerminatedEvent;
 import com.flashticket.orderservice.client.TicketClient;
 import com.flashticket.orderservice.dto.OrderResponse;
 import com.flashticket.orderservice.dto.TicketPriceResponse;
@@ -219,6 +220,15 @@ public class OrderService {
                 order.getUserId(),
                 order.getQuantity(),
                 USER_CANCELLED
+        );
+
+        orderOutboxService.createOrderTerminatedEvent(
+                new OrderTerminatedEvent(
+                        UUID.randomUUID().toString(),
+                        order.getId(),
+                        OrderStatus.CANCELLED,
+                        now
+                )
         );
 
         order.setStatus(OrderStatus.CANCELLED);
